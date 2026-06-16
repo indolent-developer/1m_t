@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Capital KO Trader",
+  "version": "1.0.0",
+  "description": "Place and close Knock-Out orders on Capital.com",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://api-capital.backend-capital.com/*",
+    "https://demo-api-capital.backend-capital.com/*",
+    "https://*.capital.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.capital.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html"
+}

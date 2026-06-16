@@ -1,0 +1,51 @@
+[project]
+name = "1m"
+version = "0.1.0"
+description = "AI-assisted momentum trading system"
+requires-python = ">=3.13"
+dependencies = [
+    # Core data & analysis
+    "pandas==2.3.3",
+    "pandas-ta==0.4.71b0",
+    "numpy==2.2.6",
+    "numba==0.61.2",
+    "tabulate==0.10.0",
+    "pytz==2026.2",
+    # Market data & screening
+    "tradingview-screener==3.2.0",
+    "requests==2.34.2",
+    "httpx==0.28.1",
+    # LLM clients
+    "anthropic==0.105.2",
+    "openai==2.40.0",
+    "google-genai==2.7.0",
+    # Broker / automation
+    "playwright==1.60.0",
+    "websockets==16.0",
+    # Notifications
+    "python-telegram-bot==22.7",
+    # Database & cache
+    "asyncpg==0.31.0",
+    # Config & utilities
+    "pyyaml==6.0.3",
+    "pydantic==2.13.4",
+    "python-dotenv==1.2.2",
+    "tenacity==9.1.4",
+    "tqdm==4.67.3",
+    "yfinance>=1.4.1",
+    "benzinga>=1.11",
+    "redis>=8.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.4.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

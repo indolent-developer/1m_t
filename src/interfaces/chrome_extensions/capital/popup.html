@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Capital KO Trader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <span class="logo">Capital KO</span>
+  <div style="display:flex;align-items:center;gap:10px">
+    <div class="status-dot connecting" id="statusDot" title="Disconnected"></div>
+    <button class="gear-btn" id="optionsBtn" title="Settings">⚙</button>
+  </div>
+</div>
+
+<!-- Market search -->
+<div class="section">
+  <label>Instrument</label>
+  <div class="search-row">
+    <input type="text" id="searchInput" placeholder="e.g. SMCI or Super Micro KO" autocomplete="off">
+    <button id="searchBtn">Search</button>
+  </div>
+  <div class="search-results" id="searchResults" style="display:none"></div>
+  <div class="instrument-card" id="instrumentCard" style="display:none">
+    <div class="name" id="instName">—</div>
+    <span class="epic-badge" id="instEpic">—</span>
+    <div class="price-row">
+      <div class="price-item"><label>Bid</label><div class="val bid" id="instBid">—</div></div>
+      <div class="price-item"><label>Ask</label><div class="val ask" id="instAsk">—</div></div>
+    </div>
+    <div class="st-row" id="stRow" style="display:none">
+      <div class="st-badge" id="stBadge">
+        <span id="stArrow">—</span>
+        <span class="st-label">ST 5m</span>
+        <span id="stValue">—</span>
+        <span class="st-dist" id="stDist"></span>
+      </div>
+      <select id="stTf" class="tf-select" title="Timeframe">
+        <option value="1m">1m</option>
+        <option value="5m" selected>5m</option>
+        <option value="15m">15m</option>
+        <option value="30m">30m</option>
+        <option value="1h">1h</option>
+        <option value="4h">4h</option>
+        <option value="1d">1d</option>
+      </select>
+    </div>
+  </div>
+</div>
+
+<!-- Order inputs -->
+<div class="section">
+  <label>Order</label>
+  <div class="order-grid">
+    <div class="input-group">
+      <label>KO Level</label>
+      <input type="number" id="koLevel" placeholder="e.g. 30.70" step="0.01">
+    </div>
+    <div class="input-group">
+      <label>Size (contracts)</label>
+      <input type="number" id="size" placeholder="e.g. 10" step="1" min="1" value="10">
+    </div>
+  </div>
+  <div class="trade-row" style="margin-top:10px">
+    <button class="btn-call" id="btnCall" disabled>Call ▲</button>
+    <button class="btn-put"  id="btnPut"  disabled>Put ▼</button>
+  </div>
+</div>
+
+<!-- Open positions -->
+<div class="section" style="border-bottom:none">
+  <div class="section-title">
+    <span>Open Positions</span>
+    <button class="refresh-btn" id="refreshBtn" title="Refresh">↻</button>
+  </div>
+  <div style="margin-top:8px">
+    <div class="positions-list" id="positionsList">
+      <div class="no-positions">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast hidden" id="toast"></div>
+
+<script src="popup.js"></script>
+</body>
+</html>

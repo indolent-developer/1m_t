@@ -76,13 +76,11 @@ docs/
 ## Setup
 
 ```bash
-# 1. Create virtualenv
-python3 -m venv .penv
-source .penv/bin/activate
-pip install -r requirements.txt
+# 1. Install dependencies (creates .venv automatically)
+uv sync --dev
 
-# 2. Install Playwright browsers (for any browser automation)
-playwright install chromium
+# 2. Install Playwright browsers
+uv run playwright install chromium
 
 # 3. Configure secrets
 cp .env.example .env
@@ -122,32 +120,32 @@ PERPLEXITY_API_KEY
 
 ```bash
 # Analyse specific tickers via Claude
-.penv/bin/python src/automation/run_ai_analysis.py --tickers NVDA TSLA AAPL
+uv run python src/automation/run_ai_analysis.py --tickers NVDA TSLA AAPL
 
 # Use Grok instead
-.penv/bin/python src/automation/run_ai_analysis.py --tickers NVDA --target grok
+uv run python src/automation/run_ai_analysis.py --tickers NVDA --target grok
 
 # Save output to data/ai_analysis/
-.penv/bin/python src/automation/run_ai_analysis.py --tickers NVDA --save
+uv run python src/automation/run_ai_analysis.py --tickers NVDA --save
 
 # Pipe from scanner
-.penv/bin/python src/scripts/scanners/run_post_market_scanner.py | \
-    .penv/bin/python src/automation/run_ai_analysis.py --stdin --save
+uv run python src/scripts/scanners/run_post_market_scanner.py | \
+    uv run python src/automation/run_ai_analysis.py --stdin --save
 ```
 
 ### Market Scanners
 
 ```bash
-PYTHONPATH=src .penv/bin/python src/scripts/scanners/run_pre_market_scanner.py
-PYTHONPATH=src .penv/bin/python src/scripts/scanners/run_post_market_scanner.py
-PYTHONPATH=src .penv/bin/python src/scripts/scanners/run_spikes_scanner.py
-PYTHONPATH=src .penv/bin/python src/scripts/scanners/run_parabolic_scanner.py
+uv run --env-file .env python src/scripts/scanners/run_pre_market_scanner.py
+uv run --env-file .env python src/scripts/scanners/run_post_market_scanner.py
+uv run --env-file .env python src/scripts/scanners/run_spikes_scanner.py
+uv run --env-file .env python src/scripts/scanners/run_parabolic_scanner.py
 ```
 
 ### Tests
 
 ```bash
-.penv/bin/pytest
+uv run pytest
 ```
 
 ## Configuration
