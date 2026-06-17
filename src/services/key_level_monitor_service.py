@@ -47,10 +47,9 @@ from adapters.brokers.entities.broker_event import BrokerEvent
 from adapters.brokers.entities.broker_event_payload import BrokerEventPayload
 from core.adapters.base_subscriber import BaseSubscriber
 from core.adapters.event_bus import IEventBus
-from core.entities.level_event import PriceLevelEvent
+from core.entities.level_event import LevelEvent, PriceLevelEvent
 from core.entities.market_data import PriceTick
 from core.entities.time_frame import TimeFrame
-from data_fetchers.data_fetcher_base import DataFetcherBase
 from services.indicator_provider import IndicatorProvider
 from services.key_level_service import KeyLevelService, KeyLevels
 from services.level_tracker import LevelTracker
@@ -73,7 +72,6 @@ class KeyLevelMonitorService(BaseSubscriber):
         symbols: list[str],
         bus: IEventBus,
         history_service: PriceHistoryService,
-        fetcher: DataFetcherBase,
         # ATR band timeframe for LevelTracker zone width
         band_timeframe: TimeFrame = TimeFrame.MINUTE_5,
         band_mult: float = 0.3,
@@ -93,7 +91,7 @@ class KeyLevelMonitorService(BaseSubscriber):
         self._symbols = list(symbols)
         self._kl_service = KeyLevelService(history_service)
         self._provider   = IndicatorProvider(
-            fetcher=fetcher,
+            history=history_service,
             symbols=self._symbols,
             timeframe=band_timeframe,
             default_period=atr_period,
@@ -119,6 +117,8 @@ class KeyLevelMonitorService(BaseSubscriber):
 
         self._hod_lod_task:   Optional[asyncio.Task] = None
         self._provider_task:  Optional[asyncio.Task] = None
+        self._add_symbol_lock = asyncio.Lock()
+        self._adding_symbols: set[str] = set()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -151,17 +151,24 @@ class KeyLevelMonitorService(BaseSubscriber):
     # ── Dynamic symbol management ─────────────────────────────────────────────
 
     async def add_symbol(self, symbol: str) -> None:
-        if symbol in self._symbols:
+        if symbol in self._symbols or symbol in self._adding_symbols:
             return
-        levels = await self._kl_service.compute_levels(symbol)
-        self._key_levels[symbol]       = levels
-        self._static_trackers[symbol]  = self._make_trackers(symbol, levels.static_levels())
-        self._hod_lod_trackers[symbol] = self._make_trackers(symbol, levels.hod_lod_levels())
-        self._label_map[symbol]        = levels.labels()
-        self._provider._symbols.append(symbol)
-        await self._provider.load()
-        self._symbols.append(symbol)
-        logger.info("KeyLevelMonitorService: added %s (%d static levels)", symbol, len(levels.static_levels()))
+        async with self._add_symbol_lock:
+            if symbol in self._symbols or symbol in self._adding_symbols:
+                return
+            self._adding_symbols.add(symbol)
+        try:
+            levels = await self._kl_service.compute_levels(symbol)
+            self._key_levels[symbol]       = levels
+            self._static_trackers[symbol]  = self._make_trackers(symbol, levels.static_levels())
+            self._hod_lod_trackers[symbol] = self._make_trackers(symbol, levels.hod_lod_levels())
+            self._label_map[symbol]        = levels.labels()
+            self._provider._symbols.append(symbol)
+            await self._provider.load_one(symbol)
+            self._symbols.append(symbol)
+            logger.info("KeyLevelMonitorService: added %s (%d static levels)", symbol, len(levels.static_levels()))
+        finally:
+            self._adding_symbols.discard(symbol)
 
     async def remove_symbol(self, symbol: str) -> None:
         if symbol not in self._symbols:
@@ -209,14 +216,38 @@ class KeyLevelMonitorService(BaseSubscriber):
             return
         tick   = payload.data
         labels = self._label_map.get(tick.symbol, {})
+
+        # ── Run existing trackers first so BREAK_BELOW fires on the old LOD ──
         trackers = (
             self._static_trackers.get(tick.symbol, []) +
             self._hod_lod_trackers.get(tick.symbol, [])
         )
         for tracker in trackers:
             for evt in tracker.update(tick):
+                evt.label = labels.get(round(evt.level, 4), "")
+                if not _event_makes_sense(evt.event, evt.label):
+                    continue
                 _log_event(evt, labels)
                 await self._bus.emit(evt)
+
+        # ── Update HOD/LOD in real-time from the tick stream ─────────────────
+        kl = self._key_levels.get(tick.symbol)
+        if kl and tick.price:
+            hod_moved = tick.price > kl.hod_5min_ago + 0.001
+            lod_moved = tick.price < kl.lod_5min_ago - 0.001
+            if hod_moved or lod_moved:
+                if hod_moved:
+                    kl.hod_5min_ago = round(tick.price, 4)
+                if lod_moved:
+                    kl.lod_5min_ago = round(tick.price, 4)
+                self._hod_lod_trackers[tick.symbol] = self._make_trackers(
+                    tick.symbol, kl.hod_lod_levels()
+                )
+                self._label_map[tick.symbol] = kl.labels()
+                logger.debug(
+                    "KeyLevelMonitorService: %s HOD/LOD → %.4f / %.4f (from tick)",
+                    tick.symbol, kl.hod_5min_ago, kl.lod_5min_ago,
+                )
 
     async def _hod_lod_refresh_loop(self) -> None:
         while True:
@@ -259,6 +290,29 @@ class KeyLevelMonitorService(BaseSubscriber):
                         "KeyLevelMonitorService: HOD/LOD refresh failed for %s: %s",
                         symbol, exc,
                     )
+
+
+# ── Event semantics filter ────────────────────────────────────────────────────
+
+_SUPPORT_LABELS = {
+    "LOD", "Prev Day Low",
+    "1H Support", "1D Support",
+    "Pivot S1", "Pivot S2", "Pivot S3",
+}
+_RESISTANCE_LABELS = {
+    "HOD", "Prev Day High",
+    "1H Resistance", "1D Resistance",
+    "Pivot R1", "Pivot R2", "Pivot R3",
+}
+
+
+def _event_makes_sense(event: LevelEvent, label: str) -> bool:
+    """Suppress semantically wrong events: rejection at support, bounce at resistance."""
+    if label in _SUPPORT_LABELS and event == LevelEvent.REJECTION:
+        return False
+    if label in _RESISTANCE_LABELS and event == LevelEvent.BOUNCE:
+        return False
+    return True
 
 
 # ── Logging helper ────────────────────────────────────────────────────────────

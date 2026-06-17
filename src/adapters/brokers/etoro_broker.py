@@ -56,7 +56,7 @@ from core.utils.log_helper import getLogger
 logger = getLogger(__name__)
 
 _BASE_URL        = "https://public-api.etoro.com"
-_CACHE_FILE      = Path(__file__).resolve().parents[3] / "data" / "etoro_instrument_cache.json"
+_TICKER_ISIN_FILE = Path(__file__).resolve().parents[3] / "data" / "ticker_isin.json"
 
 # Fields to request from /market-data/search — keeps response small and debugger-friendly.
 # Full field list: https://public-api.etoro.com/index.html (Market Data → Search)
@@ -101,6 +101,8 @@ class eToroBroker(BaseBroker):
 
         # symbol (upper) → numeric instrumentId — persisted to disk
         self._instrument_cache: Dict[str, int] = self._load_instrument_cache()
+        # reverse: instrumentId → symbol (built lazily from /market-data/instruments)
+        self._id_to_symbol: Dict[int, str] = {v: k for k, v in self._instrument_cache.items()}
 
     # ── Capabilities ──────────────────────────────────────────────────────────
 
@@ -125,16 +127,21 @@ class eToroBroker(BaseBroker):
 
     def _load_instrument_cache(self) -> Dict[str, int]:
         try:
-            if _CACHE_FILE.exists():
-                return {k: int(v) for k, v in json.loads(_CACHE_FILE.read_text()).items()}
+            if _TICKER_ISIN_FILE.exists():
+                raw = json.loads(_TICKER_ISIN_FILE.read_text())
+                return {k: int(v) for k, v in raw.get("etoro", {}).items()}
         except Exception:
             pass
         return {}
 
     def _save_instrument_cache(self) -> None:
         try:
-            _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _CACHE_FILE.write_text(json.dumps(self._instrument_cache, indent=2))
+            _TICKER_ISIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            raw = {}
+            if _TICKER_ISIN_FILE.exists():
+                raw = json.loads(_TICKER_ISIN_FILE.read_text())
+            raw["etoro"] = self._instrument_cache
+            _TICKER_ISIN_FILE.write_text(json.dumps(raw, indent=2))
         except Exception as e:
             logger.warning("[%s] Could not save instrument cache: %s", self.broker_id, e)
 
@@ -165,8 +172,14 @@ class eToroBroker(BaseBroker):
             raise ValueError(f"[{self.broker_id}] Symbol '{symbol}' not found on eToro")
 
         # Search response uses "internalInstrumentId"
-        instrument_id = int(match.get("internalInstrumentId", match.get("instrumentId", 0)))
+        instrument_id = int(
+            match.get("internalInstrumentId")
+            or match.get("instrumentID")
+            or match.get("instrumentId")
+            or 0
+        )
         self._instrument_cache[key] = instrument_id
+        self._id_to_symbol[instrument_id] = key
         self._save_instrument_cache()
         logger.debug("[%s] Resolved %s → instrumentId=%d", self.broker_id, key, instrument_id)
         return instrument_id
@@ -174,12 +187,18 @@ class eToroBroker(BaseBroker):
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
     def _headers(self) -> Dict[str, str]:
+        if self.config.is_demo:
+            pub  = self.config.public_key_demo  or self.config.public_key  or self.config.api_key
+            priv = self.config.private_key_demo or self.config.private_key
+        else:
+            pub  = self.config.public_key_live  or self.config.public_key  or self.config.api_key
+            priv = self.config.private_key_live or self.config.private_key
         return {
-            "x-api-key":     self.config.public_key or self.config.api_key,
-            "x-user-key":    self.config.private_key,
-            "x-request-id":  str(uuid.uuid4()),
-            "Content-Type":  "application/json",
-            "Accept":        "application/json",
+            "x-api-key":    pub,
+            "x-user-key":   priv,
+            "x-request-id": str(uuid.uuid4()),
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
         }
 
     def _raise_for_status(self, resp: httpx.Response) -> None:
@@ -220,8 +239,12 @@ class eToroBroker(BaseBroker):
     # ── Connection lifecycle ───────────────────────────────────────────────────
 
     async def connect(self) -> bool:
-        pub  = self.config.public_key or self.config.api_key
-        priv = self.config.private_key
+        if self.config.is_demo:
+            pub  = self.config.public_key_demo  or self.config.public_key  or self.config.api_key
+            priv = self.config.private_key_demo or self.config.private_key
+        else:
+            pub  = self.config.public_key_live  or self.config.public_key  or self.config.api_key
+            priv = self.config.private_key_live or self.config.private_key
         if not pub or not priv:
             self.connect_error = "Missing credentials — set ETORO_LIVE_PUBLIC_KEY and ETORO_LIVE_PRIVATE_KEY"
             logger.error("[%s] %s", self.broker_id, self.connect_error)
@@ -275,12 +298,51 @@ class eToroBroker(BaseBroker):
 
     async def get_positions(self, symbol: Optional[str] = None) -> List[Position]:
         self._require_connected()
-        data = await self._get(f"/api/v1/portfolios/{self._env}/positions")
-        raw_list = data.get("positions", data.get("data", []))
-        positions = [self._map_position(r) for r in raw_list]
+        data     = await self._get("/api/v1/trading/info/portfolio")
+        raw_list = (
+            data.get("positions")
+            or data.get("clientPortfolio", {}).get("positions")
+            or data.get("data", {}).get("positions")
+            or data.get("portfolio", {}).get("positions")
+            or []
+        )
+        logger.info("[%s] get_positions: %d raw positions", self.broker_id, len(raw_list))
+        # Collect instrumentIDs that aren't in the cache yet and resolve them
+        unknown_ids = [
+            r.get("instrumentID") or r.get("instrumentId")
+            for r in raw_list
+            if (r.get("instrumentID") or r.get("instrumentId")) not in self._id_to_symbol
+        ]
+        if unknown_ids:
+            await self._load_instrument_map()
+        positions = []
+        for r in raw_list:
+            try:
+                positions.append(self._map_position(r))
+            except Exception as e:
+                logger.warning("[%s] _map_position failed for %s: %s", self.broker_id, r, e)
         if symbol:
             positions = [p for p in positions if p.symbol == symbol.upper()]
         return positions
+
+    async def _load_instrument_map(self) -> None:
+        """Bulk-load instrumentID → ticker from /api/v1/market-data/instruments (symbolFull field)."""
+        try:
+            data  = await self._get(
+                "/api/v1/market-data/instruments",
+                params={"fields": "instrumentID,symbolFull"},
+            )
+            items = data.get("instrumentDisplayDatas", data.get("items", data.get("data", [])))
+            for item in items:
+                iid    = item.get("instrumentID")
+                ticker = item.get("symbolFull")
+                if iid and ticker:
+                    self._id_to_symbol[int(iid)]       = ticker.upper()
+                    self._instrument_cache[ticker.upper()] = int(iid)
+            self._save_instrument_cache()
+            logger.info("[%s] Loaded %d instruments from eToro", self.broker_id, len(self._id_to_symbol))
+        except Exception as e:
+            logger.warning("[%s] Could not load instrument map: %s", self.broker_id, e)
 
     async def get_position(self, symbol: str) -> Optional[Position]:
         positions = await self.get_positions(symbol)
@@ -289,8 +351,18 @@ class eToroBroker(BaseBroker):
     def _map_position(self, raw: dict) -> Position:
         direction = raw.get("direction", raw.get("isBuy", True))
         side      = TradeSide.LONG if direction in (True, "buy", "BUY", 1) else TradeSide.SHORT
-        # symbol: prefer internalSymbolFull if present, else str(instrumentId)
-        symbol = raw.get("internalSymbolFull") or str(raw.get("instrumentId", ""))
+        # Resolve instrumentID → ticker; field name varies across endpoints
+        iid = (
+            raw.get("instrumentID")
+            or raw.get("instrumentId")
+            or raw.get("internalInstrumentId")
+        )
+        symbol = (
+            (self._id_to_symbol.get(int(iid)) if iid else None)
+            or raw.get("internalSymbolFull")
+            or raw.get("symbolFull")
+            or str(iid or "")
+        )
         return Position(
             id=str(raw.get("positionId", raw.get("id", ""))),
             symbol=symbol,

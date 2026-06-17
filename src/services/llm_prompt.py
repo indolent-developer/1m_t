@@ -79,6 +79,9 @@ Avg 60d corr of candidate to book: {avg_corr} | Net book bias: {net_bias}
 === EARNINGS ===
 {days_to_earnings} days{blackout_flag}
 
+=== MACRO CALENDAR (US, today+5d) ===
+{econ_calendar}
+
 === HARD EVENTS ===
 {hard_events}
 

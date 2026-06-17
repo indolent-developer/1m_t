@@ -36,7 +36,7 @@ _TTL: dict[TimeFrame, int] = {
     TimeFrame.DAY:       6 * 3600,   # 6h — daily bars rarely change intraday
     TimeFrame.HOUR_1:    30 * 60,    # 30min
     TimeFrame.HOUR_4:    60 * 60,    # 1h
-    TimeFrame.MINUTE_5:  2 * 60,     # 2min — near-live
+    TimeFrame.MINUTE_5:  5 * 60,     # 5min — matches bar interval
     TimeFrame.MINUTE_1:  60,
     TimeFrame.MINUTE_15: 5 * 60,
     TimeFrame.MINUTE_30: 10 * 60,

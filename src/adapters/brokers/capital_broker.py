@@ -36,6 +36,7 @@ from core.entities.broker_entities import (
     OrderStatus,
     OrderType,
 )
+from core.entities.instrument_type import InstrumentType
 from core.entities.market_quotes import Quote
 from core.entities.position_types import Position
 
@@ -480,7 +481,13 @@ class CapitalBroker(BaseBroker):
         bid  = float(snap.get("bid",   0) or 0)
         ask  = float(snap.get("offer", 0) or 0)  # Capital uses "offer", not "ask"
         mid  = (bid + ask) / 2 if bid and ask else bid or ask
-        return Quote(symbol=symbol, bid=bid, ask=ask, last=mid)
+        return Quote(
+            symbol=symbol,
+            instrument_type=InstrumentType.STOCK,
+            bid=bid, ask=ask, last=mid,
+            bid_size=0, ask_size=0, volume=0,
+            timestamp=dt.datetime.now(dt.timezone.utc),
+        )
 
     async def get_quotes(self, symbols: List[str]) -> Dict[str, Quote]:
         results = {}

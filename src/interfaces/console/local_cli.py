@@ -58,7 +58,7 @@ from core.config.config_loader        import ConfigLoader
 
 from interfaces.console.cmd_account  import cmd_account, cmd_positions, cmd_orders, cmd_pnl, cmd_quote, cmd_fills
 from interfaces.console.cmd_trading  import cmd_trade, cmd_move, cmd_close, cmd_closeall, cmd_pending, cmd_cancel, cmd_size
-from interfaces.console.cmd_monitor       import cmd_ind, cmd_indp, cmd_scan, cmd_news, cmd_ml, ml_autoload
+from interfaces.console.cmd_monitor       import cmd_ind, cmd_indp, cmd_scan, cmd_news, cmd_ml
 from interfaces.console.cmd_search        import cmd_search
 from interfaces.console.cmd_trade_helper  import cmd_trade_helper
 from interfaces.console.cmd_sym           import cmd_sym
@@ -66,7 +66,7 @@ from interfaces.console.cmd_sym           import cmd_sym
 
 _BROKER_NAMES = ("capital", "ibkr", "etoro", "scalable")
 _SCAN_TYPES   = ("pm", "pre", "vol", "spikes", "parabolic")
-_ML_FILTERS   = ("break_up", "break_down", "bounce", "reject", "false_break", "stop", "list")
+_ML_FILTERS   = ("break_up", "break_down", "bounce", "reject", "false_break", "stop", "list", "status")
 
 
 # ── Help ──────────────────────────────────────────────────────────────────────
@@ -115,6 +115,7 @@ HELP_MONITOR = """
        Filters: break_up  break_down  bounce  reject  false_break  (default: all)
        /ml APLD 41.5 break_down
        /ml AAPL 200 210 bounce
+       /ml status [SYMBOL]  — current price + distance from watched levels
        /ml stop SYMBOL | /ml list
 
   /ind  SYMBOL [TF]              — ATR, RSI, ADX, EMA, SuperTrend
@@ -232,7 +233,7 @@ async def run(broker: BaseBroker) -> None:
     print("    /h for commands, /exit to quit.\n")
 
     ml_tasks: dict = {}  # symbol → {task, monitor, manager, levels, filters}
-    await ml_autoload(ml_tasks)
+    # ml monitors are owned by run_live_monitor.py — do not auto-start here
 
     async def _shutdown_ml():
         for entry in list(ml_tasks.values()):

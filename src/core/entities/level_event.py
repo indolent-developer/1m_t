@@ -29,3 +29,5 @@ class PriceLevelEvent:
     timestamp:      datetime          = field(default_factory=lambda: datetime.now(timezone.utc))
     dwell_seconds:  float             = 0.0
     original_break: Optional[LevelEvent] = None
+    volume:         float             = 0.0
+    label:          str               = ""

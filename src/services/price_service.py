@@ -231,13 +231,15 @@ def _parse_batch_quote(data: list) -> Dict[str, PriceQuote]:
 
 
 def _to_tick(symbol: str, q: PriceQuote) -> PriceTick:
+    # FMP timestamps are in Unix seconds; PriceTick.timestamp is Unix ms.
+    ts_ms = q.timestamp * 1000 if q.timestamp and q.timestamp < 10_000_000_000 else q.timestamp
     return PriceTick(
         symbol=symbol,
         price=q.price,
         bid=q.bid_price,
         ask=q.ask_price,
         volume=float(q.volume),
-        timestamp=q.timestamp,
+        timestamp=ts_ms,
         change_pct=q.change_percentage,
         day_high=q.day_high,
         day_low=q.day_low,

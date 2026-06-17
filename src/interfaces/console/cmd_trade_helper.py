@@ -26,6 +26,43 @@ async def cmd_trade_helper(broker, args: list) -> None:
         return
 
     symbol = args[0].upper()
+
+    # Quick symbol existence check before doing any heavy work
+    try:
+        import os
+        from services.price_service import FmpPriceService
+        _quotes = await FmpPriceService(
+            api_key=os.environ.get("FMP_API_KEY", ""), symbols=[symbol]
+        ).get_quotes()
+        if not _quotes.get(symbol) or not _quotes[symbol].price:
+            print(f"❌ Unknown symbol: {symbol}")
+            return
+    except Exception:
+        pass  # network hiccup — let the main analysis fail with its own error
+
+    # ── Spread check ──────────────────────────────────────────────────────────
+    spread_pct: float | None = None
+    spread_info: str = ""
+    if broker is not None:
+        try:
+            q = await broker.get_quote(symbol)
+            if q and q.ask and q.bid and float(q.ask) > 0:
+                spread_pct = float(q.spread / q.ask * 100)
+                spread_info = f"bid ${float(q.bid):.4f} / ask ${float(q.ask):.4f} / spread {spread_pct:.2f}%"
+                if spread_pct > 1.5:
+                    print(f"\n⚠️  {symbol}  spread {spread_pct:.2f}% exceeds 1.5% threshold — DO NOT ENTER")
+                    print(f"   {spread_info}")
+                    print("   Run /q or check liquidity before trading this stock.\n")
+                    return
+        except Exception as e:
+            print(f"  ⚠ Spread check failed ({e}) — continuing without it")
+    else:
+        print(f"⚠️  No broker connected — spread check skipped for {symbol}.")
+        answer = input("   Continue without spread check? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            return
+
     print(f"⏳ Analysing {symbol} — fetching prices, market data, news…")
 
     try:
@@ -60,11 +97,9 @@ async def cmd_trade_helper(broker, args: list) -> None:
                 print(f"  ⚠ Could not fetch positions: {e}")
 
         report = await svc.analyse(symbol, current_positions=positions or None)
-        _print_report(report)
+        _print_report(report, spread_info=spread_info)
     except Exception as e:
-        import traceback
         print(f"❌ {e}")
-        traceback.print_exc()
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -73,7 +108,7 @@ def _pct(v: float, sign: bool = True) -> str:
     return f"{v:+.2f}%" if sign else f"{v:.2f}%"
 
 
-def _print_report(r) -> None:
+def _print_report(r, spread_info: str = "") -> None:
     GREEN, RED, RESET = tty_colors()
     YELLOW = _YELLOW
 
@@ -93,7 +128,8 @@ def _print_report(r) -> None:
     print(f"  {r.company_name}")
     meta_parts = [p for p in [r.sector, r.industry, mktcap_str, beta_str] if p]
     print(f"  {' | '.join(meta_parts)}")
-    print(f"  Price: ${r.price:,.2f}   ATR(14): {r.atr:.4f}  ({r.atr_pct:.2f}%)")
+    spread_tag = f"   {spread_info}" if spread_info else ""
+    print(f"  Price: ${r.price:,.2f}   ATR(14): {r.atr:.4f}  ({r.atr_pct:.2f}%){spread_tag}")
 
     # Data-quality line: last intraday bar time + positions passed in
     lb = getattr(r, "last_bar_5m", None)

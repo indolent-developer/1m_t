@@ -298,7 +298,7 @@ class FundamentalsService:
             return 1.0
         try:
             resp = await self._http.get(
-                "https://api.frankfurter.app/latest",
+                "https://api.frankfurter.dev/v1/latest",
                 params={"from": from_ccy.upper(), "to": to_ccy.upper()},
             )
             resp.raise_for_status()

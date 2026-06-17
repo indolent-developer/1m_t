@@ -85,6 +85,7 @@ class LevelTracker:
         break_confirm_seconds: int = 60,
         break_confirm_ticks: int = 3,
         break_max_zone_dwell_seconds: int = 300,   # if price lingered in zone longer than this, exit is ambiguous
+        bounce_max_dwell_seconds: int = 300,        # bounce/rejection: zone dwell > this = consolidation, not reversal
         # ── false-break detection (back inside zone after confirmed break) ─────
         false_break_window_seconds: int = 180,
         false_break_confirm_seconds: int = 15,
@@ -97,9 +98,10 @@ class LevelTracker:
         self._dwell  = dwell_seconds
         self._atrp   = atr_period
 
-        self._confirm_secs   = break_confirm_seconds
-        self._confirm_ticks  = break_confirm_ticks
+        self._confirm_secs    = break_confirm_seconds
+        self._confirm_ticks   = break_confirm_ticks
         self._break_max_dwell = break_max_zone_dwell_seconds
+        self._bounce_max_dwell = bounce_max_dwell_seconds
         self._fb_window     = false_break_window_seconds
         self._fb_conf_secs  = false_break_confirm_seconds
         self._fb_conf_ticks = false_break_confirm_ticks
@@ -157,6 +159,7 @@ class LevelTracker:
                 price=price, zone_lo=zone_lo, zone_hi=zone_hi,
                 atr=atr, convincing=convincing, tick_source=tick.source,
                 timestamp=now, dwell_seconds=dwell, original_break=orig,
+                volume=tick.volume,
             )
 
         # ── same position ─────────────────────────────────────────────────────
@@ -200,18 +203,18 @@ class LevelTracker:
             self._entry = None
 
             if new_pos == _Pos.ABOVE:
-                if came_from == _Pos.ABOVE and dwell >= self._dwell:
+                if came_from == _Pos.ABOVE and self._dwell <= dwell <= self._bounce_max_dwell:
                     events.append(make(LevelEvent.BOUNCE, dwell=dwell))
                 elif came_from == _Pos.BELOW and dwell <= self._break_max_dwell:
                     self._pending = _PendingBreak(LevelEvent.BREAK_ABOVE, now, zone_lo, zone_hi, ticks=1)
-                # came_from UNKNOWN, or dwell too long (consolidation) → silent no-op
+                # came_from UNKNOWN, dwell too short, or consolidation (dwell > bounce_max) → silent no-op
 
             elif new_pos == _Pos.BELOW:
-                if came_from == _Pos.BELOW and dwell >= self._dwell:
+                if came_from == _Pos.BELOW and self._dwell <= dwell <= self._bounce_max_dwell:
                     events.append(make(LevelEvent.REJECTION, dwell=dwell))
                 elif came_from == _Pos.ABOVE and dwell <= self._break_max_dwell:
                     self._pending = _PendingBreak(LevelEvent.BREAK_BELOW, now, zone_lo, zone_hi, ticks=1)
-                # came_from UNKNOWN, or dwell too long (consolidation) → silent no-op
+                # came_from UNKNOWN, dwell too short, or consolidation (dwell > bounce_max) → silent no-op
 
             return events
 

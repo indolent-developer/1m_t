@@ -48,8 +48,24 @@ async def cmd_trade(broker, side_str: str, args: list) -> None:
             print("  SIZE: N shares | N% | all | eN euros | $N USD")
             return
 
-    svc = FundamentalsService()
+    svc        = FundamentalsService()
+    native_eur = getattr(broker, "native_currency", "USD").upper() == "EUR"
+
+    # For EUR-native brokers (Scalable), a plain number means EUR amount — no FX needed.
+    if native_eur and size_token:
+        _st = size_token.lower()
+        if not _st.startswith(("e", "$")) and _st not in ("all",) and not _st.endswith("%"):
+            try:
+                float(size_token)
+                size_token = f"e{size_token}"
+            except ValueError:
+                pass
+
     st  = size_token.lower()
+
+    # Trigger is in EUR if the broker is EUR-native, or if the user explicitly
+    # sized in EUR (eN prefix) — same currency context for both size and trigger.
+    trigger_in_eur = native_eur or st.startswith("e")
 
     # ── Position (needed for % / all sizes and sell guard) ────────────────────
     pos = None
@@ -116,8 +132,10 @@ async def cmd_trade(broker, side_str: str, args: list) -> None:
             print(f"  Instrument:  {_r_name}  [{_r_isin}]")
 
     # ── FX rate ───────────────────────────────────────────────────────────────
+    # EUR-native brokers (Scalable) quote in EUR already — only fetch rate for
+    # explicit USD amounts ($N); trigger prices are treated as EUR directly.
     rate = None
-    if st.startswith("$") or trigger_token is not None:
+    if st.startswith("$") or (trigger_token is not None and not trigger_in_eur):
         rate = await svc.get_fx_rate("USD", "EUR")
         if not rate:
             print("❌ Could not fetch USD/EUR rate")
@@ -169,16 +187,28 @@ async def cmd_trade(broker, side_str: str, args: list) -> None:
             if trigger_usd <= 0:
                 print(f"❌ Calculated trigger ${trigger_usd:.4f} ≤ 0")
                 return
-            trigger_eur = round(trigger_usd * rate, 4)
-            print(
-                f"  last_close=${last_close:.4f}  ATR={last_atr:.4f}  "
-                f"offset={mult}×ATR=${offset:.4f}\n"
-                f"  Trigger: ${trigger_usd:.4f} → €{trigger_eur:.4f}  (USD/EUR {rate:.4f})"
-            )
+            if trigger_in_eur:
+                trigger_eur = trigger_usd
+                print(
+                    f"  last_close=€{last_close:.4f}  ATR={last_atr:.4f}  "
+                    f"offset={mult}×ATR=€{offset:.4f}\n"
+                    f"  Trigger: €{trigger_eur:.4f}"
+                )
+            else:
+                trigger_eur = round(trigger_usd * rate, 4)
+                print(
+                    f"  last_close=${last_close:.4f}  ATR={last_atr:.4f}  "
+                    f"offset={mult}×ATR=${offset:.4f}\n"
+                    f"  Trigger: ${trigger_usd:.4f} → €{trigger_eur:.4f}  (USD/EUR {rate:.4f})"
+                )
         else:
             trigger_usd = trig["usd"]
-            trigger_eur = round(trigger_usd * rate, 4)
-            print(f"  Trigger: ${trigger_usd:.4f} → €{trigger_eur:.4f}  (USD/EUR {rate:.4f})")
+            if trigger_in_eur:
+                trigger_eur = trigger_usd
+                print(f"  Trigger: €{trigger_eur:.4f}")
+            else:
+                trigger_eur = round(trigger_usd * rate, 4)
+                print(f"  Trigger: ${trigger_usd:.4f} → €{trigger_eur:.4f}  (USD/EUR {rate:.4f})")
 
         order_type = infer_order_type(SIDE, trigger_eur, sizing_price_eur, forced_type)
         type_label = order_type.value.upper()
@@ -193,13 +223,21 @@ async def cmd_trade(broker, side_str: str, args: list) -> None:
         if SIDE == OrderSide.BUY and order_type == OrderType.STOP:
             current_ask_eur = float(quote.ask)
             if trigger_eur <= current_ask_eur:
-                current_ask_usd = round(current_ask_eur / rate, 4)
-                print(
-                    f"\n  ⚠️  Current ask ${current_ask_usd:.4f} (€{current_ask_eur:.4f}) is already "
-                    f"ABOVE your trigger ${trigger_usd:.4f}.\n"
-                    f"     A buy stop fires on breakout — trigger should be above current price.\n"
-                    f"     Drop @TRIGGER to buy at market, or append 'limit' to place a limit buy."
-                )
+                if trigger_in_eur:
+                    print(
+                        f"\n  ⚠️  Current ask €{current_ask_eur:.4f} is already "
+                        f"ABOVE your trigger €{trigger_eur:.4f}.\n"
+                        f"     A buy stop fires on breakout — trigger should be above current price.\n"
+                        f"     Drop @TRIGGER to buy at market, or append 'limit' to place a limit buy."
+                    )
+                else:
+                    current_ask_usd = round(current_ask_eur / rate, 4)
+                    print(
+                        f"\n  ⚠️  Current ask ${current_ask_usd:.4f} (€{current_ask_eur:.4f}) is already "
+                        f"ABOVE your trigger ${trigger_usd:.4f}.\n"
+                        f"     A buy stop fires on breakout — trigger should be above current price.\n"
+                        f"     Drop @TRIGGER to buy at market, or append 'limit' to place a limit buy."
+                    )
                 if input("  Proceed anyway? [y/N] › ").strip().lower() != "y":
                     print("❌ Order cancelled.")
                     return

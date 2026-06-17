@@ -405,7 +405,7 @@ class TestCommandHandlerPositions:
         handler = _make_handler(brokers={"capital": broker})
         update  = _mock_update("/positions TSLA")
         await handler.positions(update, _ctx())
-        broker.get_positions.assert_awaited_once_with(symbol="TSLA")
+        broker.get_position.assert_awaited_once_with("TSLA")
 
 
 class TestCommandHandlerOrders:

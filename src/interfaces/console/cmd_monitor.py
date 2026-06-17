@@ -384,7 +384,8 @@ async def cmd_ml(broker, args: list, ml_tasks: dict) -> None:
         print(
             "Usage: /ml SYMBOL LEVEL [LEVEL...] [filter...]\n"
             "       Filters: break_up  break_down  bounce  reject  false_break\n"
-            "       /ml levels SYMBOL  — compute + show key levels with distance\n"
+            "       /ml status [SYMBOL]  — current price + distance from watched levels\n"
+            "       /ml levels SYMBOL   — compute + show key levels with distance\n"
             "       /ml stop SYMBOL\n"
             "       /ml list\n"
             "       /ml save   — save active monitors to disk (auto-saved on add/stop)\n"
@@ -396,15 +397,13 @@ async def cmd_ml(broker, args: list, ml_tasks: dict) -> None:
     sub = args[0].lower()
 
     if sub == "list":
-        if not ml_tasks:
-            print("No active level monitors.")
+        saved = _load_ml_levels()
+        if not saved:
+            print("No saved level monitors.")
         else:
-            for sym, entry in ml_tasks.items():
-                lvl_str = ", ".join(str(l) for l in entry["levels"])
-                flt_str = (
-                    ", ".join(f.value for f in entry["filters"])
-                    if entry["filters"] else "all"
-                )
+            for sym, cfg in saved.items():
+                lvl_str = ", ".join(str(l) for l in cfg.get("levels", []))
+                flt_str = ", ".join(cfg.get("filters", [])) or "all"
                 print(f"  • {sym}: [{lvl_str}]  filters=[{flt_str}]")
         return
 
@@ -458,6 +457,47 @@ async def cmd_ml(broker, args: list, ml_tasks: dict) -> None:
                 print("   Break alerts → Telegram")
         else:
             print("Nothing new to load.")
+        return
+
+    if sub == "status":
+        target   = args[1].upper() if len(args) > 1 else None
+        snapshot = {s: e for s, e in ml_tasks.items() if target is None or s == target}
+        if not snapshot:
+            print(f"No monitor for {target}" if target else "No active level monitors.")
+            return
+        import os as _os
+        GREEN, RED, RESET = tty_colors()
+        for sym, entry in snapshot.items():
+            price = None
+            try:
+                q     = await broker.get_quote(sym)
+                price = float(q.last or q.mid or q.bid or 0) or None
+            except Exception:
+                pass
+            if not price:
+                try:
+                    from services.price_service import FmpPriceService as _FmpPS
+                    _svc    = _FmpPS(api_key=_os.environ.get("FMP_API_KEY", ""), symbols=[sym])
+                    _quotes = await _svc.get_quotes()
+                    _q      = _quotes.get(sym)
+                    price   = float(_q.price) if _q and _q.price else None
+                except Exception:
+                    pass
+            price_str = f"{price:,.4f}" if price else "N/A"
+            flt_str = ", ".join(f.value for f in entry["filters"]) if entry["filters"] else "all"
+            print(f"\n📍 {sym}  price: {price_str}  ({flt_str})")
+            print(f"  {'Level':>10}   {'Dir':>3}   {'Distance':>10}   {'%':>6}")
+            print(f"  {'─'*44}")
+            for level in sorted(entry["levels"]):
+                if price:
+                    diff   = level - price
+                    pct    = diff / price * 100
+                    arrow  = "↑" if diff > 0 else "↓"
+                    col    = GREEN if diff > 0 else RED
+                    print(f"  {level:>10.4f}   {col}{arrow}{RESET}     {col}{abs(diff):>10.4f}{RESET}   {col}{abs(pct):>5.2f}%{RESET}")
+                else:
+                    print(f"  {level:>10.4f}   —        —          —")
+        print()
         return
 
     if sub == "stop":

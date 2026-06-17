@@ -77,8 +77,8 @@ class KeyLevels:
         for v in self.hourly_support:    m[v] = "1H Support"
         for v in self.daily_resistance:  m[v] = "1D Resistance"
         for v in self.daily_support:     m[v] = "1D Support"
-        if self.hod_5min_ago: m[self.hod_5min_ago] = "HOD-5min"
-        if self.lod_5min_ago: m[self.lod_5min_ago] = "LOD-5min"
+        if self.hod_5min_ago: m[self.hod_5min_ago] = "HOD"
+        if self.lod_5min_ago: m[self.lod_5min_ago] = "LOD"
         return m
 
     def static_levels(self) -> list[float]:

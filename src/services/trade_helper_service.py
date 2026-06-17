@@ -47,6 +47,7 @@ _TTL_MKT_CTX =  5 * 60   # SPY / QQQ / VIX snapshot
 _TTL_OHLCV   = 15 * 60   # daily OHLCV bars
 _TTL_NEWS    = 10 * 60   # news + hard events
 _TTL_EARNINGS = 60 * 60       # next earnings date
+_TTL_ECON_CAL =  4 * 60 * 60  # macro economic calendar (same for all symbols)
 _TTL_CORR     = 24 * 60 * 60  # 60d return correlations — only changes at EOD
 
 # Intraday TTL = one candle duration (data can't be fresher than the candle)
@@ -586,6 +587,57 @@ class TradeHelperService:
         self._cache.save(symbol, None, category="earnings", metadata={"ttl": _TTL_EARNINGS})
         return None
 
+    # ── Macro economic calendar ───────────────────────────────────────────────
+
+    def _get_econ_calendar_sync(self) -> str:
+        """Return today+5d US macro calendar as compact text. Cached 4 hours."""
+        cached = self._cache.load("__global__", category="econ_calendar")
+        if cached is not None:
+            return cached
+        try:
+            import requests
+            today = dt.date.today()
+            to    = today + dt.timedelta(days=5)
+            r = requests.get(
+                "https://financialmodelingprep.com/api/v3/economic_calendar",
+                params={
+                    "from":   today.isoformat(),
+                    "to":     to.isoformat(),
+                    "apikey": self._fmp_key,
+                },
+                timeout=10,
+            )
+            events = [e for e in r.json() if e.get("country") == "US"]
+            lines = []
+            for e in events:
+                date_str = e.get("date", "")[:16]   # "YYYY-MM-DD HH:MM"
+                try:
+                    ts = dt.datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+                    label = ts.strftime("%m/%d %H:%M")
+                except ValueError:
+                    label = date_str
+                impact  = (e.get("impact") or "").capitalize()
+                name    = e.get("event", "")
+                actual  = e.get("actual")
+                est     = e.get("estimate")
+                prev    = e.get("previous")
+                parts = []
+                if actual is not None:
+                    parts.append(f"actual={actual}")
+                if est is not None:
+                    parts.append(f"est={est}")
+                if prev is not None:
+                    parts.append(f"prev={prev}")
+                detail = ", ".join(parts) if parts else "pending"
+                lines.append(f"{label} [{impact}] {name}: {detail}")
+            result = "\n".join(lines) if lines else "(none)"
+        except Exception as exc:
+            logger.warning("[TradeHelper] econ calendar fetch failed: %s", exc)
+            result = "(unavailable)"
+        self._cache.save("__global__", result, category="econ_calendar",
+                         metadata={"ttl": _TTL_ECON_CAL})
+        return result
+
     # ── Position sizing + sector concentration ───────────────────────────────
 
     def _compute_sizing(
@@ -658,6 +710,7 @@ class TradeHelperService:
         session_ratio:      str        = "—",
         portfolio_positions: list[dict] | None = None,
         portfolio_corrs:    dict[str, float] | None = None,
+        econ_calendar:      str        = "(unavailable)",
     ) -> dict:
         """Returns a dict matching the LLM output schema (all keys always present)."""
         if not self._xai_key:
@@ -733,6 +786,7 @@ class TradeHelperService:
                 "vix_regime":       mkt.vix_regime,
                 "days_to_earnings": str(earnings_days) if earnings_days is not None else ">30",
                 "blackout_flag":    blackout,
+                "econ_calendar":    econ_calendar,
                 "hard_events":      (
                     "\n".join(f"[{e['event'].upper()}] score={e['score']:+.1f}  {e['headline']}"
                               for e in events)
@@ -943,8 +997,11 @@ class TradeHelperService:
         last_bar_5m    = str(df_5m["t"].iloc[-1]) if not df_5m.empty else None
 
         loop = asyncio.get_event_loop()
-        events, news_items, headlines = await loop.run_in_executor(None, self._get_news_sync, symbol)
-        earnings_days                 = await loop.run_in_executor(None, self._earnings_days_sync, symbol)
+        (events, news_items, headlines), earnings_days, econ_calendar = await asyncio.gather(
+            loop.run_in_executor(None, self._get_news_sync, symbol),
+            loop.run_in_executor(None, self._earnings_days_sync, symbol),
+            loop.run_in_executor(None, self._get_econ_calendar_sync),
+        )
 
         llm = await self._llm_analyse(
             symbol, company_name, sector, market_cap, beta, description,
@@ -952,6 +1009,7 @@ class TradeHelperService:
             bars_5m=bars_5m_csv, bars_1h=bars_1h_csv,
             vol_1=vol_1, vol_2=vol_2, session_ratio=session_ratio,
             portfolio_positions=positions, portfolio_corrs=portfolio_corrs,
+            econ_calendar=econ_calendar,
         )
 
         verdict    = llm["verdict"]

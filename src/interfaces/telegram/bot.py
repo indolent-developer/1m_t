@@ -129,7 +129,7 @@ class TelegramBot:
         app.add_handler(TGCommandHandler("indp",      cmd_indp))
         app.add_handler(TGCommandHandler("fills",     cmd_fills))
         app.add_handler(TGCommandHandler("ml",        cmd_ml))
-        app.add_handler(TGCommandHandler("monitor-levels", cmd_ml))
+        app.add_handler(TGCommandHandler("monitor_levels", cmd_ml))
         # Shortcuts
         app.add_handler(TGCommandHandler("h",   cmd_help))
         app.add_handler(TGCommandHandler("a",   cmd_account))
@@ -355,7 +355,7 @@ class TradingBot:
             ("halt",      self._cmd.halt),
             ("resume",    self._cmd.resume),
             ("ml",        self._cmd.monitor_levels),
-            ("monitor-levels", self._cmd.monitor_levels),
+            ("monitor_levels", self._cmd.monitor_levels),
         ]
 
         for name, handler in commands:

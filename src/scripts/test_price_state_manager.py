@@ -21,6 +21,8 @@ load_dotenv()
 from adapters.events.local_event_bus import LocalEventBus
 from core.entities.level_event import LevelEvent, PriceLevelEvent
 from data_fetchers.financial_modelling_prep_data_fetcher import FmpDataFetcher
+from infrastructure.cache.redis_cache import RedisCache
+from services.price_history_service import PriceHistoryService
 from services.price_monitor import PriceMonitor
 from services.price_state_manager import PriceStateManager
 
@@ -68,11 +70,16 @@ async def main() -> None:
     for evt in LevelEvent:
         bus.subscribe(evt, on_level_event)
 
-    fmp_key = os.environ.get("FMP_API_KEY", "")
-    symbols = list(LEVELS.keys())
-    monitor = PriceMonitor(symbols=symbols, bus=bus, poll_interval=20)
-    fmp     = FmpDataFetcher({"api_key": fmp_key})
-    manager = PriceStateManager(levels=LEVELS, bus=bus, fetcher=fmp)
+    fmp_key  = os.environ.get("FMP_API_KEY", "")
+    symbols  = list(LEVELS.keys())
+    monitor  = PriceMonitor(symbols=symbols, bus=bus, poll_interval=20)
+    fmp      = FmpDataFetcher({"api_key": fmp_key})
+    history  = PriceHistoryService(
+        fetcher=fmp,
+        cache=RedisCache(url=os.environ.get("REDIS_URL", "redis://localhost:6379")),
+        fetcher_name="fmp",
+    )
+    manager = PriceStateManager(levels=LEVELS, bus=bus, history=history)
 
     print(f"Loading indicators and watching {len(symbols)} symbols for {RUN_SECONDS}s...")
     print("-" * 90)

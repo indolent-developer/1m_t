@@ -121,22 +121,22 @@ async def test_run_cli_returns_none_on_error():
 
 
 @pytest.mark.asyncio
-async def test_run_cli_returns_none_on_file_not_found():
+async def test_run_cli_raises_on_file_not_found():
     broker = _broker()
     with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
-        result = await broker._run_cli(["account", "summary"])
-    assert result is None
+        with pytest.raises(RuntimeError, match="sc binary not found"):
+            await broker._run_cli(["account", "summary"])
 
 
 @pytest.mark.asyncio
-async def test_run_cli_returns_none_on_invalid_json():
+async def test_run_cli_raises_on_invalid_json():
     broker = _broker()
     proc = MagicMock()
     proc.returncode = 0
     proc.communicate = AsyncMock(return_value=(b"not-json{{{", b""))
     with patch("asyncio.create_subprocess_exec", return_value=proc):
-        result = await broker._run_cli(["account", "summary"])
-    assert result is None
+        with pytest.raises(RuntimeError, match="non-JSON"):
+            await broker._run_cli(["account", "summary"])
 
 
 @pytest.mark.asyncio
@@ -306,7 +306,7 @@ async def test_get_positions_filter_by_symbol():
 async def test_get_position_returns_none_if_missing():
     broker = _broker()
     broker._connected = True
-    with patch("asyncio.create_subprocess_exec", return_value=_cli_response([])):
+    with patch("asyncio.create_subprocess_exec", return_value=_holdings_response([])):
         pos = await broker.get_position("NVDA")
     assert pos is None
 
@@ -314,20 +314,26 @@ async def test_get_position_returns_none_if_missing():
 # ── place_order ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_place_order_returns_submitted():
+async def test_place_order_returns_filled():
     broker = _broker()
     broker._connected = True
     broker._isin_cache["AAPL"] = "US0378331005"
+    broker._load_ticker_overrides = lambda: {}
 
     responses = [
         _quote_response(),      # broker quote
         _phase1_response(),     # trade phase-1
-        _phase2_response(),     # trade phase-2
+        _phase2_response(),     # trade phase-2 → ORDER_SUBMITTED emitted
+        # poll: transactions list contains the fill
+        _cli_response({"items": [{
+            "isin": "US0378331005", "status": "SETTLED",
+            "side": "BUY", "quantity": 10.0, "amount": 1860.0,
+        }]}),
     ]
     with patch("asyncio.create_subprocess_exec", side_effect=responses):
         order = await broker.place_order("AAPL", 10, OrderSide.BUY, OrderType.MARKET)
 
-    assert order.status == OrderStatus.SUBMITTED
+    assert order.status == OrderStatus.FILLED
     assert order.symbol == "AAPL"
     assert order.broker_order_id == "ORD-123"
 
@@ -337,10 +343,17 @@ async def test_place_order_emits_order_submitted():
     broker = _broker()
     broker._connected = True
     broker._isin_cache["AAPL"] = "US0378331005"
+    broker._load_ticker_overrides = lambda: {}
     events = []
     broker.events.subscribe(BrokerEvent.ORDER_SUBMITTED, lambda p: events.append(p.event))
 
-    responses = [_quote_response(), _phase1_response(), _phase2_response()]
+    responses = [
+        _quote_response(), _phase1_response(), _phase2_response(),
+        _cli_response({"items": [{
+            "isin": "US0378331005", "status": "SETTLED",
+            "side": "BUY", "quantity": 5.0, "amount": 930.0,
+        }]}),
+    ]
     with patch("asyncio.create_subprocess_exec", side_effect=responses):
         await broker.place_order("AAPL", 5, OrderSide.BUY, OrderType.MARKET)
 
@@ -387,6 +400,7 @@ async def test_preview_order_sell_succeeds_when_position_exists():
     broker = _broker()
     broker._connected = True
     broker._isin_cache["NFLX"] = "US64110W1027"
+    broker._load_ticker_overrides = lambda: {}  # prevent ticker_isin.json from overriding test ISIN
 
     responses = [
         # get_positions() call from the SELL guard
@@ -432,7 +446,7 @@ async def test_preview_order_stop_buy_includes_stop_price_in_args():
     original_run_cli = broker._run_cli
 
     call_count = 0
-    async def capturing_run_cli(args):
+    async def capturing_run_cli(args, **kwargs):
         nonlocal call_count
         call_count += 1
         captured_args.append(list(args))
@@ -474,6 +488,10 @@ async def test_submit_order_extracts_order_id_from_envelope():
     broker = _broker()
     broker._connected = True
 
+    async def _skip_poll(order_id, submitted_order, *, isin=""):
+        return submitted_order
+    broker._poll_order_status_sync = _skip_poll
+
     preview = {
         "_base_args": ["broker", "trade", "buy", "--isin", "US0378331005", "--amount", "1850.0"],
         "_isin": "US0378331005",
@@ -510,6 +528,7 @@ async def test_place_stop_sell_order():
     broker = _broker()
     broker._connected = True
     broker._isin_cache["WOLF"] = "DE000A2H9AX3"
+    broker._load_ticker_overrides = lambda: {}  # prevent ticker_isin.json from overriding test ISIN
 
     responses = [
         # SELL guard: get_positions() — position exists
@@ -526,6 +545,14 @@ async def test_place_stop_sell_order():
         order = await broker.place_order(
             "WOLF", 50, OrderSide.SELL, OrderType.STOP, price=3.50
         )
+
+    # Cancel the background poll task that STOP orders launch
+    for t in list(broker._order_poll_tasks.values()):
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
 
     assert order.status == OrderStatus.SUBMITTED
     assert order.broker_order_id == "ORD-STOP-789"

@@ -39,7 +39,7 @@ def print_order_preview(side: str, symbol: str, qty: float, preview: dict) -> No
 
 def print_triggered_preview(
     type_label: str, side: str, symbol: str, qty: int,
-    trigger_usd: float, trigger_eur: float, rate: float, preview: dict,
+    trigger_usd: float, trigger_eur: float, rate: float | None, preview: dict,
 ) -> None:
     cur       = preview.get("currency", "EUR")
     side_up   = side.upper()
@@ -47,6 +47,10 @@ def print_triggered_preview(
     price_key = "ask" if side_up == "BUY" else "bid"
     fee_key   = "entry" if side_up == "BUY" else "exit"
     fee_val   = (preview.get("ex_ante_costs") or {}).get(fee_key, preview.get("fee_entry", "—"))
+    if rate is not None:
+        trigger_line = f"  Trigger:     ${trigger_usd:.4f}  →  €{trigger_eur:.4f}  (rate {rate:.4f})"
+    else:
+        trigger_line = f"  Trigger:     €{trigger_eur:.4f}"
     print(
         f"\n  {'─'*44}\n"
         f"  {f'{type_label}-{side_up} ORDER PREVIEW':^44}\n"
@@ -54,7 +58,7 @@ def print_triggered_preview(
         f"  Side:        {type_label}-{side_up} {qty} × {symbol}\n"
         f"  Instrument:  {inst_name or '—'}\n"
         f"  ISIN:        {preview.get('isin', '—')}\n"
-        f"  Trigger:     ${trigger_usd:.4f}  →  €{trigger_eur:.4f}  (rate {rate:.4f})\n"
+        f"{trigger_line}\n"
         f"  Current {price_key}:  {preview.get(price_key, '—')} {cur}\n"
         f"  Venue:       {preview.get('venue', '—')}\n"
         f"  Fee:         {fee_val} {cur}\n"

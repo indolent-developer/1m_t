@@ -9,14 +9,18 @@ Replicates TradingView "nk-post-market-movers" screener:
   - Post-mkt change OUTSIDE -3% to +3%  (|chg| > 3%)
   - Post-mkt volume > 100K
 
+Output is always saved to:
+  <project_root>/data/daily_morning/post-market-movers/DD.MM.YYYY_post_movers.csv
+
 Install: pip install tradingview-screener pandas tabulate
-Run:     python pm_movers_scanner.py
-         python pm_movers_scanner.py --limit 30 --min-pmchg 5
+Run:     python run_post_market_scanner.py
+         python run_post_market_scanner.py --limit 30 --min-pmchg 5
 """
 
 import argparse
 import sys
 from datetime import datetime
+from pathlib import Path
 
 try:
     from tradingview_screener import Query, col
@@ -25,14 +29,38 @@ except ImportError:
     print("Missing deps. Run:  pip install tradingview-screener pandas tabulate")
     sys.exit(1)
 
+# ── Paths ────────────────────────────────────────────────────────────────────
+_ROOT       = Path(__file__).resolve().parents[3]
+_MOVERS_DIR = _ROOT / "data" / "daily_morning" / "post-market-movers"
+
 # ── Config ──────────────────────────────────────────────────────────────────
 DEFAULT_LIMIT       = 50
-DEFAULT_MIN_PMCHG   = 3.0   # abs post-mkt change threshold (%)
+DEFAULT_MIN_PMCHG   = 3.0
 DEFAULT_MIN_PRICE   = 2.0
 DEFAULT_MIN_MKTCAP  = 300_000_000
 DEFAULT_MIN_AVGVOL  = 500_000
 DEFAULT_MIN_PMVOL   = 100_000
 # ────────────────────────────────────────────────────────────────────────────
+
+# All columns fetched from TradingView screener
+_COLS = [
+    # identity
+    "name", "description", "sector", "type", "exchange",
+    # current session
+    "open", "high", "low", "close", "change", "volume",
+    # post-market
+    "postmarket_change", "postmarket_volume", "postmarket_close",
+    # prior sessions (TradingView provides up to 2 bars back)
+    "open[1]", "high[1]", "low[1]", "close[1]", "volume[1]",
+    "open[2]", "high[2]", "low[2]", "close[2]", "volume[2]",
+    # technicals
+    "RSI", "ADX", "ADX+DI", "ADX-DI", "EMA20", "EMA50",
+    # volume context
+    "average_volume_10d_calc", "average_volume_30d_calc",
+    "relative_volume_intraday|5",
+    # fundamentals
+    "market_cap_basic",
+]
 
 
 def fmt_mktcap(v):
@@ -56,7 +84,7 @@ def run_scanner(
     min_mktcap=DEFAULT_MIN_MKTCAP,
     min_avgvol=DEFAULT_MIN_AVGVOL,
     min_pmvol=DEFAULT_MIN_PMVOL,
-):
+) -> pd.DataFrame:
     print(f"\n{'─'*60}")
     print(f"  POST-MARKET MOVERS SCANNER  |  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'─'*60}")
@@ -64,25 +92,19 @@ def run_scanner(
           f"AvgVol>{fmt_vol(min_avgvol)} | |PM Chg|>{min_pmchg}% | PM Vol>{fmt_vol(min_pmvol)}")
     print(f"{'─'*60}\n")
 
-    COLS = [
-        "name", "description", "close", "change", "volume",
-        "market_cap_basic", "average_volume_30d_calc",
-        "postmarket_change", "postmarket_volume", "sector", "type",
-    ]
-    BASE_FILTERS = [
+    base_filters = [
         col("close") > min_price,
         col("market_cap_basic") > min_mktcap,
         col("average_volume_30d_calc") > min_avgvol,
         col("postmarket_volume") > min_pmvol,
     ]
 
-    # Two server-side queries mirror TradingView "outside -3% to 3%"
     def _query(extra_filter):
         _, frame = (
             Query()
             .set_markets("america")
-            .select(*COLS)
-            .where(*BASE_FILTERS, extra_filter)
+            .select(*_COLS)
+            .where(*base_filters, extra_filter)
             .order_by("postmarket_volume", ascending=False)
             .limit(500)
             .get_scanner_data()
@@ -100,7 +122,6 @@ def run_scanner(
         print("  No results found. Market may be closed / pre-market not active.\n")
         return df
 
-    # ── Gainers ──────────────────────────────────────────────────────────
     gainers = df[df["postmarket_change"] > 0].copy()
     losers  = df[df["postmarket_change"] < 0].copy()
 
@@ -136,18 +157,50 @@ def run_scanner(
     return df
 
 
+def save_results(df: pd.DataFrame, date: datetime | None = None) -> Path:
+    """Save scanner results to the standard daily movers directory."""
+    _MOVERS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = (date or datetime.now()).strftime("%d.%m.%Y")
+    path = _MOVERS_DIR / f"{ts}_post_movers.csv"
+    df.to_csv(path, index=False)
+    print(f"  Saved → {path}\n")
+    return path
+
+
+def run_and_save(
+    limit=DEFAULT_LIMIT,
+    min_pmchg=DEFAULT_MIN_PMCHG,
+    min_price=DEFAULT_MIN_PRICE,
+    min_mktcap=DEFAULT_MIN_MKTCAP,
+    min_avgvol=DEFAULT_MIN_AVGVOL,
+    min_pmvol=DEFAULT_MIN_PMVOL,
+) -> tuple[pd.DataFrame, Path | None]:
+    """Run scanner and always save results. Returns (df, saved_path)."""
+    df = run_scanner(
+        limit=limit,
+        min_pmchg=min_pmchg,
+        min_price=min_price,
+        min_mktcap=min_mktcap,
+        min_avgvol=min_avgvol,
+        min_pmvol=min_pmvol,
+    )
+    if df.empty:
+        return df, None
+    path = save_results(df)
+    return df, path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Post-Market Movers Scanner")
-    parser.add_argument("--limit",      type=int,   default=DEFAULT_LIMIT,     help="Max results (default 50)")
-    parser.add_argument("--min-pmchg",  type=float, default=DEFAULT_MIN_PMCHG, help="Min |PM change| %% (default 3)")
-    parser.add_argument("--min-price",  type=float, default=DEFAULT_MIN_PRICE, help="Min price (default 2)")
-    parser.add_argument("--min-mktcap", type=float, default=DEFAULT_MIN_MKTCAP,help="Min mkt cap (default 300M)")
-    parser.add_argument("--min-avgvol", type=float, default=DEFAULT_MIN_AVGVOL,help="Min avg vol 30D (default 500K)")
-    parser.add_argument("--min-pmvol",  type=float, default=DEFAULT_MIN_PMVOL, help="Min PM volume (default 100K)")
-    parser.add_argument("--csv",        action="store_true",                   help="Also save results to CSV")
+    parser.add_argument("--limit",      type=int,   default=DEFAULT_LIMIT,      help="Max results (default 50)")
+    parser.add_argument("--min-pmchg",  type=float, default=DEFAULT_MIN_PMCHG,  help="Min |PM change| %% (default 3)")
+    parser.add_argument("--min-price",  type=float, default=DEFAULT_MIN_PRICE,  help="Min price (default 2)")
+    parser.add_argument("--min-mktcap", type=float, default=DEFAULT_MIN_MKTCAP, help="Min mkt cap (default 300M)")
+    parser.add_argument("--min-avgvol", type=float, default=DEFAULT_MIN_AVGVOL, help="Min avg vol 30D (default 500K)")
+    parser.add_argument("--min-pmvol",  type=float, default=DEFAULT_MIN_PMVOL,  help="Min PM volume (default 100K)")
     args = parser.parse_args()
 
-    df = run_scanner(
+    _, saved = run_and_save(
         limit=args.limit,
         min_pmchg=args.min_pmchg,
         min_price=args.min_price,
@@ -155,11 +208,8 @@ def main():
         min_avgvol=args.min_avgvol,
         min_pmvol=args.min_pmvol,
     )
-
-    if args.csv and not df.empty:
-        fname = f"pm_movers_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-        df.to_csv(fname, index=False)
-        print(f"  Saved → {fname}\n")
+    if saved:
+        print(f"  Results saved to: {saved}\n")
 
 
 if __name__ == "__main__":

@@ -310,6 +310,29 @@ def v2_portfolio_indicators(tf: str, results: list, skipped: list) -> str:
     return "\n".join(lines)
 
 
+def fmt_ml_status(monitors_snapshot: dict, prices: dict) -> str:
+    """Format /ml status: current price + distance to each watched level."""
+    if not monitors_snapshot:
+        return "No active level monitors."
+    lines = ["*📍 Level Monitor Status*\n"]
+    for sym, entry in monitors_snapshot.items():
+        price = prices.get(sym, 0.0)
+        price_str = f"{price:,.4f}" if price else "N/A"
+        flt_str = ", ".join(f.value for f in entry["filters"]) if entry["filters"] else "all"
+        lines.append(f"*{sym}*  `{price_str}`  _({flt_str})_")
+        for level in sorted(entry["levels"]):
+            if price > 0:
+                diff = level - price
+                pct  = diff / price * 100
+                arrow = "↑" if diff > 0 else "↓"
+                lines.append(
+                    f"  `{level:.4f}`  {arrow} `{abs(diff):.4f}` ({abs(pct):.2f}%)"
+                )
+            else:
+                lines.append(f"  `{level:.4f}`  _(price unavailable)_")
+    return "\n".join(lines)
+
+
 def v2_error(msg: str) -> str:
     return f"❌ {_esc(msg)}"
 

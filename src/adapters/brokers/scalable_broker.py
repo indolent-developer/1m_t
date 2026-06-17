@@ -137,6 +137,8 @@ class ScalableBroker(BaseBroker):
 
     # ── Capabilities ─────────────────────────────────────────────────────────
 
+    native_currency: str = "EUR"
+
     @property
     def capabilities(self) -> BrokerCapabilities:
         return BrokerCapabilities(
@@ -1137,12 +1139,14 @@ async def search_symbol(broker: "ScalableBroker", sym: str):
     try:
         isin = await broker._resolve_isin(sym)
         data = await broker._cli_result(["broker", "quote", "--isin", isin])
-        name = (data or {}).get("name", "") or broker._isin_name_cache.get(isin.upper(), "")
-        bid  = float((data or {}).get("bid_price", (data or {}).get("bid", 0)) or 0)
-        ask  = float((data or {}).get("ask_price", (data or {}).get("ask", 0)) or 0)
-        mid  = float((data or {}).get("mid_price", (data or {}).get("mid", 0)) or 0)
+        d    = data or {}
+        name = d.get("name", "") or broker._isin_name_cache.get(isin.upper(), "")
+        bid  = float(d.get("quote_bid_price") or d.get("bid_price") or d.get("bid") or 0)
+        ask  = float(d.get("quote_ask_price") or d.get("ask_price") or d.get("ask") or 0)
+        mid  = float(d.get("quote_mid_price") or d.get("mid_price") or d.get("mid") or 0)
         if not bid and mid:
             bid = ask = mid
         return True, isin, name, bid, ask, ["long only", "no leverage"]
-    except Exception:
+    except Exception as e:
+        logger.warning("[ScalableBroker] search_symbol(%s) failed: %s", sym, e)
         return False, "—", "not tradeable", 0.0, 0.0, ["not tradeable"]

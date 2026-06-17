@@ -114,6 +114,7 @@ HELP_TEXT = """
      Filters: break_up  break_down  bounce  reject  (default: all)
      /ml APLD 41.5 break_down      — alert when APLD breaks below 41.5
      /ml AAPL 200 210 bounce       — alert on bounces at 200 and 210
+     /ml status [SYMBOL]           — current price + distance from watched levels
      /ml stop SYMBOL               — stop monitoring
      /ml list                      — list active monitors
 
@@ -843,6 +844,23 @@ _ML_FILTER_MAP = {
 }
 
 
+async def _ml_fetch_price(symbol: str, broker=None) -> float:
+    """Return current price via broker quote or FmpPriceService (with fallback routing)."""
+    if broker is not None:
+        try:
+            q = await broker.get_quote(symbol)
+            price = float(q.last or q.mid or q.bid or 0)
+            if price > 0:
+                return price
+        except Exception:
+            pass
+    from services.price_service import FmpPriceService
+    svc    = FmpPriceService(api_key=os.environ.get("FMP_API_KEY", ""), symbols=[symbol])
+    quotes = await svc.get_quotes()
+    q      = quotes.get(symbol)
+    return float(q.price) if q and q.price else 0.0
+
+
 def _fmt_level_event(evt) -> str:
     _LABEL = {
         "break_above": "▲ BREAK ABOVE",
@@ -913,11 +931,19 @@ async def _ml_start_monitor(
         bus.subscribe(evt, _on_event)
 
     fmp_key = os.environ.get("FMP_API_KEY", "")
+    from infrastructure.cache.redis_cache import RedisCache
+    from services.price_history_service import PriceHistoryService
+    _fmp     = FmpDataFetcher({"api_key": fmp_key})
+    _history = PriceHistoryService(
+        fetcher=_fmp,
+        cache=RedisCache(url=os.environ.get("REDIS_URL", "redis://localhost:6379")),
+        fetcher_name="fmp",
+    )
     monitor = PriceMonitor(symbols=[symbol], bus=bus, poll_interval=20)
     manager = PriceStateManager(
         levels={symbol: levels},
         bus=bus,
-        fetcher=FmpDataFetcher({"api_key": fmp_key}),
+        history=_history,
     )
     await manager.start()
 
@@ -941,6 +967,7 @@ async def cmd_ml(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "*Level Monitor*\n"
             "`/ml SYMBOL LEVEL [LEVEL...] [filter...]`\n"
             "Filters: `break_up`  `break_down`  `bounce`  `reject`  `false_break`\n"
+            "`/ml status [SYMBOL]` —  current price + distance from levels\n"
             "`/ml stop SYMBOL`  —  stop monitoring\n"
             "`/ml list`         —  list active monitors\n"
             "`/ml save`         —  save active monitors to disk\n"
@@ -1020,6 +1047,24 @@ async def cmd_ml(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"✅ Loaded: {syms}", parse_mode="Markdown")
         else:
             await update.message.reply_text("Nothing new to load.", parse_mode="Markdown")
+        return
+
+    if sub == "status":
+        target   = args[1].upper() if len(args) > 1 else None
+        snapshot = {s: e for s, e in _ml_monitors.items() if target is None or s == target}
+        if not snapshot:
+            msg = f"No monitor for `{target}`" if target else "No active level monitors."
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+        broker = context.bot_data.get("broker")
+        prices = {}
+        for sym in snapshot:
+            try:
+                prices[sym] = await _ml_fetch_price(sym, broker)
+            except Exception:
+                prices[sym] = 0.0
+        from interfaces.telegram.formatters import fmt_ml_status
+        await update.message.reply_text(fmt_ml_status(snapshot, prices), parse_mode="Markdown")
         return
 
     if sub == "stop":
@@ -1793,6 +1838,25 @@ class CommandHandler:
                 await update.message.reply_text(f"✅ Loaded: {syms}", parse_mode="Markdown")
             else:
                 await update.message.reply_text("Nothing new to load.", parse_mode="Markdown")
+            return
+
+        if sub == "status":
+            target   = args[1].upper() if len(args) > 1 else None
+            snapshot = {s: e for s, e in self._level_monitors.items() if target is None or s == target}
+            if not snapshot:
+                msg = f"No monitor for `{target}`" if target else "No active level monitors."
+                await update.message.reply_text(msg, parse_mode="Markdown")
+                return
+            parsed  = _parse(update.message.text)
+            broker, _, _ = self._resolve_broker(chat_id, parsed.broker, parsed.account)
+            prices = {}
+            for sym in snapshot:
+                try:
+                    prices[sym] = await _ml_fetch_price(sym, broker)
+                except Exception:
+                    prices[sym] = 0.0
+            from interfaces.telegram.formatters import fmt_ml_status
+            await update.message.reply_text(fmt_ml_status(snapshot, prices), parse_mode="Markdown")
             return
 
         if sub == "stop":

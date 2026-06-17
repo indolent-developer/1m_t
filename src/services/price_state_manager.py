@@ -34,9 +34,9 @@ from core.adapters.event_bus import IEventBus
 from core.entities.level_event import LevelEvent
 from core.entities.market_data import PriceTick
 from core.entities.time_frame import TimeFrame
-from data_fetchers.data_fetcher_base import DataFetcherBase
 from services.indicator_provider import IndicatorProvider
 from services.level_tracker import LevelTracker
+from services.price_history_service import PriceHistoryService
 
 logger = getLogger(__name__)
 
@@ -47,7 +47,7 @@ class PriceStateManager(BaseSubscriber):
         self,
         levels: Dict[str, List[float]],
         bus: IEventBus,
-        fetcher: DataFetcherBase,
+        history: PriceHistoryService,
         atr_period: int = 14,
         band_timeframe: TimeFrame = TimeFrame.MINUTE_5,
         band_mult: float = 0.3,
@@ -62,7 +62,7 @@ class PriceStateManager(BaseSubscriber):
         super().__init__(bus)
 
         self._provider = IndicatorProvider(
-            fetcher=fetcher,
+            history=history,
             symbols=list(levels.keys()),
             timeframe=band_timeframe,
             default_period=atr_period,
