@@ -73,6 +73,9 @@ class PreMarketScannerLoop(BaseScannerLoop):
             return []
         hits = []
         for _, row in df.iterrows():
+            pm_vol  = float(row["premarket_volume"]) if row.get("premarket_volume") else None
+            avg_vol = float(row["average_volume_30d_calc"]) if row.get("average_volume_30d_calc") else None
+            rel_vol = round(pm_vol / avg_vol, 1) if pm_vol and avg_vol else None
             hits.append(ScannerHit(
                 event=ScannerEvent.SYMBOL_DETECTED,
                 symbol=row["name"],
@@ -84,8 +87,9 @@ class PreMarketScannerLoop(BaseScannerLoop):
                 description=row.get("description"),
                 sector=row.get("sector"),
                 market_cap=float(row["market_cap_basic"]) if row.get("market_cap_basic") else None,
-                volume=float(row["premarket_volume"]) if row.get("premarket_volume") else None,
-                avg_vol_30d=float(row["average_volume_30d_calc"]) if row.get("average_volume_30d_calc") else None,
+                volume=pm_vol,
+                avg_vol_30d=avg_vol,
+                rel_vol=rel_vol,
             ))
         return hits
 
@@ -102,5 +106,7 @@ class PreMarketScannerLoop(BaseScannerLoop):
         up   = Query().set_markets("america").select(*_COLS).where(*base, col("premarket_change") >  self._min_pmchg).order_by("premarket_volume", ascending=False).limit(500).get_scanner_data()[1]
         down = Query().set_markets("america").select(*_COLS).where(*base, col("premarket_change") < -self._min_pmchg).order_by("premarket_volume", ascending=False).limit(500).get_scanner_data()[1]
         frames = [f for f in [up, down] if not f.empty]
-        df     = pd.concat(frames, ignore_index=True).drop_duplicates(subset="name") if frames else pd.DataFrame()
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True).drop_duplicates(subset="name")
         return df.sort_values("premarket_change", ascending=False).head(self._limit)

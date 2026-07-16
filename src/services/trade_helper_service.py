@@ -49,6 +49,7 @@ _TTL_NEWS    = 10 * 60   # news + hard events
 _TTL_EARNINGS = 60 * 60       # next earnings date
 _TTL_ECON_CAL =  4 * 60 * 60  # macro economic calendar (same for all symbols)
 _TTL_CORR     = 24 * 60 * 60  # 60d return correlations — only changes at EOD
+_TTL_RATINGS  = 60 * 60       # analyst upgrades/downgrades — stable intraday
 
 # Intraday TTL = one candle duration (data can't be fresher than the candle)
 _TTL_INTRADAY: dict[str, int] = {"1m": 60, "5m": 300, "15m": 900}
@@ -207,11 +208,46 @@ class TradeHelperReport:
     hold_plan:    dict | None          # {horizon, carry_condition}
     level_read:   str | None           # 1-sentence key structure from bars
     portfolio_fit: dict | None         # {effect, note} from LLM
+    position_action: dict | None       # {action, size_pct, reason, re_entry} — only when position held
     validation_issues: list[str]       # from validate_card — empty = levels are clean
 
     # Debug / data-quality fields
     last_bar_5m:       str | None      # timestamp of the most recent 5m bar fetched
     portfolio_positions: list[dict]    # positions passed into this analysis (may be empty)
+
+
+@dataclass
+class PortfolioSnapshot:
+    """Lightweight technical + event snapshot for an already-held position.
+
+    Produced by TradeHelperService.portfolio_stock_analysis() — no LLM call, no
+    SuperTrend/bars/entry-zone machinery. Just the numbers a position-management
+    review (thesis intact/weakened/broken, HOLD/ADD/TRIM/EXIT) needs as evidence.
+    """
+    symbol:         str
+    company_name:   str
+    sector:         str
+    price:          float
+    atr:            float
+    atr_pct:        float
+    rsi:            float
+    adx:            float
+    ema8:           float
+    ema20:          float
+    ema50:          float
+    st_dir:         int             # 1 = long-side trend, -1 = short-side (daily SuperTrend)
+    st_value:       float
+    ret_1d:         float           # stock's own 1d/5d return (%) — magnitude of "the red"
+    ret_5d:         float
+    rel_vol:        float           # today's volume vs 20d average — spikes often mean news-driven
+    spy_price:      float
+    spy_above_200d: bool
+    spy_ret_1d:     float           # market-wide 1d move — is this stock-specific or broad selloff?
+    vix:            float
+    vix_regime:     str
+    earnings_days:  int | None
+    news_events:    list[dict]      # hard-event detections {event, score, headline}
+    news_items:     list[dict]      # {title, ts, source}
 
 
 # ── Service ───────────────────────────────────────────────────────────────────
@@ -233,6 +269,7 @@ class TradeHelperService:
         max_adv_pct:          float               = 0.01,
         max_sector_pct:       float               = 30.0,
         book_sector_exposure: dict[str, float] | None = None,
+        price_history_svc=None,  # PriceHistoryService — for live today's bars
     ) -> None:
         self._fmp_key        = fmp_key       or os.environ.get("FMP_API_KEY", "")
         self._xai_key        = xai_key or os.environ.get("XAI_API_KEY", "")
@@ -247,9 +284,10 @@ class TradeHelperService:
         self._max_sector_pct = max_sector_pct
         self._book_sectors   = book_sector_exposure or {}
 
-        self._cache        = MemoryCache()
-        self._fundamentals = FundamentalsService(api_key=self._fmp_key) if self._fmp_key else None
-        self._news_svc     = NewsService(lookback_days=news_days)
+        self._cache         = MemoryCache()
+        self._fundamentals  = FundamentalsService(api_key=self._fmp_key) if self._fmp_key else None
+        self._news_svc      = NewsService(lookback_days=news_days)
+        self._price_history = price_history_svc
 
     @classmethod
     def from_config_yaml(cls, path: str = "config.yaml", **overrides) -> "TradeHelperService":
@@ -411,7 +449,34 @@ class TradeHelperService:
             logger.warning("[TradeHelper] Bars fetch %s %s failed: %s", symbol, tf, e)
             return "", pd.DataFrame()
 
+    @staticmethod
+    def _ohlcdata_to_df(bars: list) -> "pd.DataFrame":
+        """Convert list[OHLCData] → DataFrame with t,o,h,l,c,v columns (naive ET)."""
+        if not bars:
+            return pd.DataFrame(columns=["t", "o", "h", "l", "c", "v"])
+        rows = [{"t": b.time, "o": b.open, "h": b.high, "l": b.low,
+                 "c": b.close, "v": float(b.volume or 0)} for b in bars]
+        df = pd.DataFrame(rows)
+        return df.sort_values("t").reset_index(drop=True)
+
     async def _fetch_intraday_bars(self, symbol: str) -> dict:
+        if self._price_history is not None:
+            try:
+                from core.entities.time_frame import TimeFrame
+                bars_5m, bars_1h = await asyncio.gather(
+                    self._price_history.get_intraday_bars(symbol, TimeFrame.MINUTE_5),
+                    self._price_history.get_intraday_bars(symbol, TimeFrame.HOUR_1),
+                )
+                df_5m   = self._ohlcdata_to_df(bars_5m)
+                df_1h   = self._ohlcdata_to_df(bars_1h)
+                csv_5m  = _ohlcv_to_csv(df_5m, 20) if not df_5m.empty else ""
+                csv_1h  = _ohlcv_to_csv(df_1h, 20) if not df_1h.empty else ""
+                logger.debug("[TradeHelper] %s: 5m bars via PriceHistoryService — %d bars, last %s",
+                             symbol, len(df_5m), df_5m["t"].iloc[-1] if not df_5m.empty else "—")
+                return {"5m_csv": csv_5m, "1h_csv": csv_1h, "5m_df": df_5m}
+            except Exception as e:
+                logger.warning("[TradeHelper] PriceHistoryService bars failed (%s), falling back to FMP", e)
+
         (csv_5m, df_5m), (csv_1h, _) = await asyncio.gather(
             self._fetch_bars(symbol, "5m", 20),
             self._fetch_bars(symbol, "1h", 20),
@@ -552,7 +617,10 @@ class TradeHelperService:
                     break
 
         result = list(seen.values()), news_items, headlines
-        self._cache.save(symbol, result, category="news", metadata={"ttl": _TTL_NEWS})
+        # Only cache when we actually got articles — don't let a failed fetch
+        # poison the cache and suppress news for the full TTL window.
+        if news_items:
+            self._cache.save(symbol, result, category="news", metadata={"ttl": _TTL_NEWS})
         return result
 
     # ── Earnings ──────────────────────────────────────────────────────────────
@@ -638,6 +706,47 @@ class TradeHelperService:
                          metadata={"ttl": _TTL_ECON_CAL})
         return result
 
+    # ── Analyst upgrades / downgrades (14d) ──────────────────────────────────
+
+    def _get_analyst_ratings_sync(self, symbol: str, days: int = 14) -> str:
+        """Fetch FMP upgrades-downgrades for last `days` days. Returns compact text."""
+        cached = self._cache.load(symbol, category="ratings")
+        if cached is not None:
+            return cached
+        try:
+            import httpx as _httpx
+            cutoff = dt.date.today() - dt.timedelta(days=days)
+            resp = _httpx.get(
+                "https://financialmodelingprep.com/stable/upgrades-downgrades",
+                params={"symbol": symbol, "apikey": self._fmp_key},
+                timeout=10,
+            )
+            items = resp.json() if resp.status_code == 200 else []
+            if not isinstance(items, list):
+                items = []
+            lines = []
+            for item in items:
+                date_str = (item.get("publishedDate") or item.get("date") or "")[:10]
+                try:
+                    item_date = dt.date.fromisoformat(date_str)
+                except (ValueError, TypeError):
+                    continue
+                if item_date < cutoff:
+                    continue
+                firm   = item.get("gradingCompany") or item.get("analyst") or ""
+                action = (item.get("action") or "").upper()
+                prev_g = item.get("previousGrade") or "—"
+                new_g  = item.get("newGrade") or "—"
+                pt     = item.get("priceTarget") or item.get("priceWhenPosted")
+                pt_str = f" PT ${float(pt):.2f}" if pt else ""
+                lines.append(f"{date_str} [{firm}] {action}: {prev_g} → {new_g}{pt_str}")
+            result = "\n".join(lines) if lines else "(none in 14d)"
+        except Exception as e:
+            logger.warning("[TradeHelper] Analyst ratings fetch failed: %s", e)
+            result = "(unavailable)"
+        self._cache.save(symbol, result, category="ratings", metadata={"ttl": _TTL_RATINGS})
+        return result
+
     # ── Position sizing + sector concentration ───────────────────────────────
 
     def _compute_sizing(
@@ -711,6 +820,12 @@ class TradeHelperService:
         portfolio_positions: list[dict] | None = None,
         portfolio_corrs:    dict[str, float] | None = None,
         econ_calendar:      str        = "(unavailable)",
+        analyst_ratings:    str        = "(unavailable)",
+        live_bid:           float | None = None,
+        live_ask:           float | None = None,
+        last_bar_ts:        dt.datetime | None = None,
+        own_position:       dict | None = None,
+        print_prompt:       bool = False,
     ) -> dict:
         """Returns a dict matching the LLM output schema (all keys always present)."""
         if not self._xai_key:
@@ -737,6 +852,29 @@ class TradeHelperService:
             elif mins < 16*60:   phase = "final hour"
             else:                phase = "after-hours"
             last_bar_time = bars_5m.strip().splitlines()[-1].split(",")[0] if bars_5m.strip() else "—"
+
+            # ── Live quote + bar staleness ─────────────────────────────────────
+            if live_bid and live_ask:
+                live_mid    = (live_bid + live_ask) / 2
+                live_quote_str = f"Bid ${live_bid:.4f} / Ask ${live_ask:.4f} / Mid ${live_mid:.4f}"
+            else:
+                live_mid       = None
+                live_quote_str = "(no live quote)"
+
+            bar_staleness_warn = ""
+            if last_bar_ts is not None:
+                now_utc  = dt.datetime.now(dt.timezone.utc)
+                # OHLCData.time is naive ET; FundamentalsService mislabels ET as UTC.
+                # In both cases, interpret the wall-clock value as ET and convert correctly.
+                bar_wall = last_bar_ts.replace(tzinfo=None)  # strip any incorrect tz label
+                bar_ts_utc = bar_wall.replace(tzinfo=et).astimezone(dt.timezone.utc)
+                bar_age_s  = (now_utc - bar_ts_utc).total_seconds()
+                bar_age_m  = int(bar_age_s / 60)
+                age_str    = f"{bar_age_m}m" if bar_age_m < 120 else f"{bar_age_m // 60}h{bar_age_m % 60}m"
+                bar_staleness_warn = f"  ⚠ bars are {age_str} old — trust live quote over bar levels for current price location" if bar_age_m > 30 else f"  (bar age {age_str})"
+            else:
+                age_str = "unknown"
+                bar_staleness_warn = "  ⚠ bar age unknown"
 
             # ── Formatted fields ──────────────────────────────────────────────
             blackout = "  ⚠ BLACKOUT RISK" if earnings_days is not None and earnings_days <= 3 else ""
@@ -784,10 +922,13 @@ class TradeHelperService:
                 "qqq_r5d":          f"{mkt.qqq_ret_5d*100:+.2f}",
                 "vix":              f"{mkt.vix:.1f}",
                 "vix_regime":       mkt.vix_regime,
-                "days_to_earnings": str(earnings_days) if earnings_days is not None else ">30",
-                "blackout_flag":    blackout,
-                "econ_calendar":    econ_calendar,
-                "hard_events":      (
+                "days_to_earnings":     str(earnings_days) if earnings_days is not None else ">30",
+                "blackout_flag":        blackout,
+                "econ_calendar":        econ_calendar,
+                "analyst_ratings":      analyst_ratings,
+                "live_quote":           live_quote_str,
+                "bar_staleness_warn":   bar_staleness_warn,
+                "hard_events":          (
                     "\n".join(f"[{e['event'].upper()}] score={e['score']:+.1f}  {e['headline']}"
                               for e in events)
                     if events else "none"
@@ -799,17 +940,38 @@ class TradeHelperService:
             }
 
             # ── Portfolio section ─────────────────────────────────────────────
-            from services.llm_prompt import format_portfolio_lines
+            from services.llm_prompt import (
+                build_system_prompt, format_portfolio_lines, format_open_position_section,
+            )
             p_lines, avg_corr, net_bias = format_portfolio_lines(
                 portfolio_positions or [], portfolio_corrs or {}
             )
-            ctx["portfolio_lines"] = p_lines
-            ctx["avg_corr"]        = avg_corr
-            ctx["net_bias"]        = net_bias
+            ctx["portfolio_lines"]       = p_lines
+            ctx["avg_corr"]              = avg_corr
+            ctx["net_bias"]              = net_bias
+            ctx["open_position_section"] = format_open_position_section(own_position)
+
+            system_prompt = build_system_prompt(own_position)
+            user_prompt   = build_user_prompt(ctx)
+
+            if print_prompt:
+                _HR = "=" * 72
+                full_text = (
+                    f"\n{_HR}\nSYSTEM PROMPT\n{_HR}\n{system_prompt}"
+                    f"\n\n{_HR}\nUSER PROMPT\n{_HR}\n{user_prompt}\n{_HR}\n"
+                )
+                print(full_text)
+                try:
+                    import subprocess as _sp
+                    _sp.run(["pbcopy"], input=full_text.encode(), check=False)
+                    print("  → prompt copied to clipboard\n")
+                except Exception:
+                    pass
+                return self._rule_based_verdict(tech, mkt, events)
 
             req = LLMRequest(
-                prompt=build_user_prompt(ctx),
-                system=SYSTEM_PROMPT,
+                prompt=user_prompt,
+                system=system_prompt,
                 model=self._llm_model,
                 max_tokens=1_200,
                 temperature=0.3,
@@ -835,6 +997,7 @@ class TradeHelperService:
                 "watch_for":         card.get("watch_for",         None),
                 "portfolio_fit":     card.get("portfolio_fit",     None),
                 "hold_plan":         card.get("hold_plan",         None),
+                "position_action":   card.get("position_action",   None),
                 "validation_issues": card.get("validation_issues", []),
                 "synthesis":         card.get("synthesis",         ""),
             }
@@ -873,7 +1036,7 @@ class TradeHelperService:
                 "bull_case": [],
                 "bear_case":  [f"Structural event: {e['event']}" for e in blocking],
                 "key_risks":  ["Stock may halt or be de-listed — no new entries"],
-                "hold_plan":  None,
+                "hold_plan":  None, "position_action": None,
                 "synthesis":  "Structural event (bankruptcy/going concern) present. Avoid all entries.",
             }
 
@@ -938,7 +1101,7 @@ class TradeHelperService:
             "verdict": verdict, "side_bias": side, "confidence": conf,
             "timeframe": None, "sentiment": None, "level_read": None,
             "entry": None, "stop": None, "targets": [], "risk_reward": None,
-            "watch_for": None, "portfolio_fit": None, "hold_plan": None,
+            "watch_for": None, "portfolio_fit": None, "hold_plan": None, "position_action": None,
             "validation_issues": [],
             "bull_case": bull, "bear_case": bear, "key_risks": risks,
             "synthesis": synth,
@@ -950,6 +1113,10 @@ class TradeHelperService:
         self,
         symbol:            str,
         current_positions: list[dict] | None = None,
+        live_bid:          float | None = None,
+        live_ask:          float | None = None,
+        own_position:      dict | None = None,
+        print_prompt:      bool = False,
     ) -> TradeHelperReport:
         symbol = symbol.upper()
         now    = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -997,11 +1164,14 @@ class TradeHelperService:
         last_bar_5m    = str(df_5m["t"].iloc[-1]) if not df_5m.empty else None
 
         loop = asyncio.get_event_loop()
-        (events, news_items, headlines), earnings_days, econ_calendar = await asyncio.gather(
+        (events, news_items, headlines), earnings_days, econ_calendar, analyst_ratings = await asyncio.gather(
             loop.run_in_executor(None, self._get_news_sync, symbol),
             loop.run_in_executor(None, self._earnings_days_sync, symbol),
             loop.run_in_executor(None, self._get_econ_calendar_sync),
+            loop.run_in_executor(None, self._get_analyst_ratings_sync, symbol),
         )
+
+        last_bar_ts: dt.datetime | None = df_5m["t"].iloc[-1].to_pydatetime() if not df_5m.empty else None
 
         llm = await self._llm_analyse(
             symbol, company_name, sector, market_cap, beta, description,
@@ -1010,6 +1180,12 @@ class TradeHelperService:
             vol_1=vol_1, vol_2=vol_2, session_ratio=session_ratio,
             portfolio_positions=positions, portfolio_corrs=portfolio_corrs,
             econ_calendar=econ_calendar,
+            analyst_ratings=analyst_ratings,
+            live_bid=live_bid,
+            live_ask=live_ask,
+            last_bar_ts=last_bar_ts,
+            own_position=own_position,
+            print_prompt=print_prompt,
         )
 
         verdict    = llm["verdict"]
@@ -1025,6 +1201,7 @@ class TradeHelperService:
         hold_plan        = llm.get("hold_plan")
         level_read       = llm.get("level_read")
         portfolio_fit    = llm.get("portfolio_fit")
+        position_action  = llm.get("position_action")
         validation_issues = llm.get("validation_issues", [])
         targets_list = llm.get("targets", [])
         llm_entry  = llm.get("entry")
@@ -1099,6 +1276,7 @@ class TradeHelperService:
             watch_for         = watch_for,
             portfolio_fit     = portfolio_fit,
             hold_plan         = hold_plan,
+            position_action   = position_action,
             level_read        = level_read,
             validation_issues = validation_issues,
             last_bar_5m       = last_bar_5m,
@@ -1106,3 +1284,67 @@ class TradeHelperService:
         )
         self._cache.save(symbol, report, category="report", metadata={"ttl": _TTL_REPORT})
         return report
+
+    async def portfolio_stock_analysis(self, symbol: str) -> PortfolioSnapshot:
+        """Fetch technicals + market context + news/earnings for a held position —
+        no LLM call. Completely separate from analyse()/_llm_analyse() (the /th
+        entry-pitch pipeline): callers driving a position-management decision
+        (e.g. /analyzep) use this for raw evidence and bring their own prompt.
+        """
+        symbol = symbol.upper()
+
+        ohlcv_task   = asyncio.create_task(self._get_ohlcv(symbol))
+        mkt_task     = asyncio.create_task(self._market_context())
+        profile_task = (
+            asyncio.create_task(self._fundamentals.get_profile(symbol))
+            if self._fundamentals else None
+        )
+
+        ohlcv, mkt = await asyncio.gather(ohlcv_task, mkt_task)
+        profile    = await profile_task if profile_task else None
+        tech       = self._compute_technicals(ohlcv)
+
+        loop = asyncio.get_event_loop()
+        (events, news_items, _headlines), earnings_days = await asyncio.gather(
+            loop.run_in_executor(None, self._get_news_sync, symbol),
+            loop.run_in_executor(None, self._earnings_days_sync, symbol),
+        )
+
+        # tech["price"] is the last daily-bar close — can be a full session stale.
+        # Prefer FMP's real-time quote (regular/pre/post routing) for "current price".
+        price = tech.get("price", 0.0)
+        try:
+            from services.price_service import FmpPriceService
+            quotes = await FmpPriceService(api_key=self._fmp_key, symbols=[symbol]).get_quotes()
+            live = quotes.get(symbol)
+            if live and live.price:
+                price = live.price
+        except Exception as e:
+            logger.warning("[TradeHelper] live quote fetch failed for %s (%s) — using last daily close", symbol, e)
+
+        return PortfolioSnapshot(
+            symbol         = symbol,
+            company_name   = (profile.company_name or symbol) if profile else symbol,
+            sector         = (profile.sector or "Unknown") if profile else "Unknown",
+            price          = price,
+            atr            = tech.get("atr", 0.0),
+            atr_pct        = tech.get("atr_pct", 0.0),
+            rsi            = tech.get("rsi", 0.0),
+            adx            = tech.get("adx", 0.0),
+            ema8           = tech.get("ema8", 0.0),
+            ema20          = tech.get("ema20", 0.0),
+            ema50          = tech.get("ema50", 0.0),
+            st_dir         = tech.get("st_dir", 0),
+            st_value       = tech.get("st_value", 0.0),
+            ret_1d         = tech.get("ret_1d", 0.0),
+            ret_5d         = tech.get("ret_5d", 0.0),
+            rel_vol        = tech.get("rel_vol", 1.0),
+            spy_price      = mkt.spy_price,
+            spy_above_200d = mkt.spy_above_200d,
+            spy_ret_1d     = mkt.spy_ret_1d * 100,  # mkt.spy_ret_1d is a fraction; tech's ret_1d is already %
+            vix            = mkt.vix,
+            vix_regime     = mkt.vix_regime,
+            earnings_days  = earnings_days,
+            news_events    = events,
+            news_items     = news_items,
+        )

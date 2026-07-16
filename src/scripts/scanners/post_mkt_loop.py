@@ -2,22 +2,26 @@
 scripts.scanners.post_mkt_loop — PostMarketScannerLoop
 
 Continuous post-market movers scanner. Replicates the TradingView
-"nk-post-market-movers" screener. Intended to run from 16:00 ET to ~20:00 ET
-but the loop itself does not enforce session hours.
+"nk-post-market-movers" screener. Runs 16:00–20:00 ET; skips outside that window.
 
 Criteria (defaults match run_post_market_scanner.py):
     Price > $2  |  MCap > $300M  |  AvgVol30D > 500K
-    |PostMktChg| > 3%  |  PostMktVol > 100K
+    |PostMktChg| > 2%  |  PostMktVol > 100K
 """
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+
+import pytz
 
 from core.adapters.event_bus import IEventBus
 from core.entities.scanner_event import ScannerEvent, ScannerHit
 from core.utils.log_helper import getLogger
 
 from .base_loop import BaseScannerLoop
+
+_ET = pytz.timezone("America/New_York")
 
 logger = getLogger(__name__)
 
@@ -36,7 +40,7 @@ class PostMarketScannerLoop(BaseScannerLoop):
         interval_seconds: int = 120,
         ttl_seconds: int = 3600,
         cache = None,
-        min_pmchg: float = 3.0,
+        min_pmchg: float = 2.0,
         min_price: float = 2.0,
         min_mktcap: float = 300_000_000,
         min_avgvol: float = 500_000,
@@ -56,6 +60,13 @@ class PostMarketScannerLoop(BaseScannerLoop):
         return "post_market"
 
     async def scan(self) -> list[ScannerHit]:
+        now    = datetime.now(_ET)
+        open_  = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+        close_ = now.replace(hour=20, minute=0,  second=0, microsecond=0)
+        if now < open_ or now >= close_:
+            logger.debug("[post_market] outside post-market hours (16:00–20:00 ET) — skipping scan")
+            return []
+
         try:
             df = await asyncio.get_event_loop().run_in_executor(None, self._query)
         except Exception:

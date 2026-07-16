@@ -66,7 +66,13 @@ def _trade_args(
     """Build the sc broker trade CLI args for phase 1."""
     from core.entities.broker_entities import OrderType
     args = ["broker", "trade", action, "--isin", isin]
-    if action == "buy":
+    if action == "buy" and limit_price is not None:
+        # --amount + --limit-price causes CONFIRMATION_FIELDS_MISMATCH (Scalable
+        # validates that limit_price == their internal calculation, which we can't
+        # predict).  --shares + --order-type limit + --limit-price is unambiguous
+        # and passes validation cleanly.
+        args += ["--shares", str(int(shares))]
+    elif action == "buy":
         args += ["--amount", str(amount_eur)]
     else:
         args += ["--shares", str(int(shares))]
@@ -132,6 +138,7 @@ class ScalableBroker(BaseBroker):
         self._isin_cache:      Dict[str, str] = {}   # symbol/name → ISIN (session cache)
         self._isin_name_cache: Dict[str, str] = {}   # ISIN → human-readable name
         self._ticker_overrides: Dict[str, str] = {}   # populated lazily per resolve
+        self._isin_ticker_cache: Dict[str, str] = self._build_isin_ticker_cache()
         self._cli_lock = asyncio.Lock()              # sc binary is not concurrency-safe
         self._fundamentals      = self._init_fundamentals()
 
@@ -178,6 +185,18 @@ class ScalableBroker(BaseBroker):
             section = data.get(self.broker_id, {})
             # skip _isin_override — that key is for ISIN→ticker resolution, not execution
             return {k.upper(): v for k, v in section.items() if not k.startswith("_")}
+        except Exception:
+            return {}
+
+    def _build_isin_ticker_cache(self) -> Dict[str, str]:
+        """Build ISIN→ticker reverse map from data/ticker_isin.json."""
+        path = Path(__file__).resolve().parents[3] / "data" / "ticker_isin.json"
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+            section = data.get(self.broker_id, {})
+            return {isin.upper(): ticker.upper()
+                    for ticker, isin in section.items()
+                    if not ticker.startswith("_")}
         except Exception:
             return {}
 
@@ -366,6 +385,11 @@ class ScalableBroker(BaseBroker):
             if data is None:
                 raise RuntimeError("sc broker overview returned no data — check sc CLI is installed and run 'sc login'")
 
+            # Seed the account cache so the immediately-following get_account_info()
+            # call in the CLI startup does not fire a second subprocess round-trip.
+            self._account_cache    = self._parse_account_info(data)
+            self._account_cache_ts = time.time()
+
             self._connected = True
             logger.info(
                 "[%s] Scalable Capital broker ready (readonly=%s)",
@@ -397,24 +421,13 @@ class ScalableBroker(BaseBroker):
 
     # ── Account ───────────────────────────────────────────────────────────────
 
-    async def get_account_info(self) -> AccountInfo:
-        self._require_connected()
-        now = time.time()
-        if self._account_cache and (now - self._account_cache_ts) < self.config.account_cache_ttl_seconds:
-            return self._account_cache
-
-        data = await self._cli_result(["broker", "overview"])
-        if not data:
-            raise RuntimeError("sc broker overview returned no data")
-
-        valuation   = data.get("valuation", {})
-        total       = float(valuation.get("total", 0))
-        securities  = float(valuation.get("securities", 0))
-        cash        = total - securities
-        account_id  = str(data.get("account_id", ""))
-
-        info = AccountInfo(
-            account_id=account_id,
+    def _parse_account_info(self, data: dict) -> AccountInfo:
+        valuation  = data.get("valuation", {})
+        total      = float(valuation.get("total", 0))
+        securities = float(valuation.get("securities", 0))
+        cash       = total - securities
+        return AccountInfo(
+            account_id=str(data.get("account_id", "")),
             account_name="Scalable Capital",
             status="active",
             account_type="broker",
@@ -427,6 +440,17 @@ class ScalableBroker(BaseBroker):
             broker_specific_data=data,
         )
 
+    async def get_account_info(self) -> AccountInfo:
+        self._require_connected()
+        now = time.time()
+        if self._account_cache and (now - self._account_cache_ts) < self.config.account_cache_ttl_seconds:
+            return self._account_cache
+
+        data = await self._cli_result(["broker", "overview"])
+        if not data:
+            raise RuntimeError("sc broker overview returned no data")
+
+        info = self._parse_account_info(data)
         self._account_cache    = info
         self._account_cache_ts = now
 
@@ -528,12 +552,21 @@ class ScalableBroker(BaseBroker):
         )
         if not sizing_price:
             raise RuntimeError(f"Cannot get quote for {symbol} (ISIN {isin})")
-        amount = round(quantity * sizing_price, 2)
+
+        # Scalable EIX: --amount buys always produce a GTC limit at a backend-derived
+        # price (~64% below market) regardless of --order-type. Work around by computing
+        # the limit at ask + 10% (fills immediately) and setting amount = qty × limit so
+        # that Scalable's validation (amount / limit_price == shares) always holds and
+        # doesn't raise CONFIRMATION_FIELDS_MISMATCH.
+        _market_buy  = action == "buy" and order_type == OrderType.MARKET
+        _limit_price = round(sizing_price * 1.10, 4) if _market_buy else (price if order_type == OrderType.LIMIT else None)
+        amount       = round(quantity * (_limit_price if _market_buy else sizing_price), 2)
 
         base_args = _trade_args(
-            action, isin, quantity, amount, order_type,
-            stop_price=price  if order_type == OrderType.STOP  else None,
-            limit_price=price if order_type == OrderType.LIMIT else None,
+            action, isin, quantity, amount,
+            OrderType.LIMIT if _market_buy else order_type,
+            stop_price=price if order_type == OrderType.STOP else None,
+            limit_price=_limit_price,
         )
         logger.info("[%s] %s %s isin=%s qty=%.2f args=%s",
                     self.broker_id, action.upper(), symbol, isin, quantity, base_args)
@@ -681,11 +714,22 @@ class ScalableBroker(BaseBroker):
         )
         if not sizing_price:
             raise RuntimeError(f"Cannot get quote for {symbol}")
-        amount = round(quantity * sizing_price, 2)
 
+        # Scalable EIX: --amount buys always produce a GTC limit at a backend-derived
+        # price (~64% below market) regardless of --order-type. Work around by computing
+        # the limit at ask + 10% (fills immediately) and setting amount = qty × limit so
+        # that Scalable's validation (amount / limit_price == shares) always holds and
+        # doesn't raise CONFIRMATION_FIELDS_MISMATCH.
+        _market_buy     = action == "buy" and order_type == OrderType.MARKET
         stop_price_eur  = price if order_type == OrderType.STOP  else None
-        limit_price_eur = price if order_type == OrderType.LIMIT else None
-        base_args  = _trade_args(action, isin, quantity, amount, order_type, stop_price=stop_price_eur, limit_price=limit_price_eur)
+        limit_price_eur = (round(sizing_price * 1.10, 4) if _market_buy else
+                           (price if order_type == OrderType.LIMIT else None))
+        amount          = round(quantity * (limit_price_eur if _market_buy else sizing_price), 2)
+        base_args  = _trade_args(
+            action, isin, quantity, amount,
+            OrderType.LIMIT if _market_buy else order_type,
+            stop_price=stop_price_eur, limit_price=limit_price_eur,
+        )
         phase1_raw = await self._run_cli(base_args)
         if not phase1_raw:
             raise RuntimeError("Phase-1 returned no output")
@@ -954,60 +998,40 @@ class ScalableBroker(BaseBroker):
     async def get_pending_orders(self) -> List[Order]:
         """
         Return resting orders (stop / limit) that have not yet filled.
-        Uses sc broker orders which lists open/pending order book entries,
-        distinct from broker transactions (filled history).
+        Uses sc broker transactions filtered to pre-fill statuses.
         """
         self._require_connected()
-        data = await self._cli_result(["broker", "orders"])
+        data = await self._cli_result([
+            "broker", "transactions",
+            "--status", "CREATED",
+            "--status", "PENDING",
+            "--status", "PARTIAL_FILLED",
+            "--type-filter", "BUY",
+            "--type-filter", "SELL",
+            "--page-size", "100",
+        ])
         if not data:
             return []
         raw = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
         return [self._map_pending_order(o) for o in raw if o]
 
     def _map_pending_order(self, data: dict) -> Order:
-        """Map a broker orders item to an Order entity."""
-        order_id   = str(data.get("id") or data.get("order_id") or "")
-        symbol     = str(data.get("name") or data.get("isin") or "")
-        raw_side   = str(data.get("side") or data.get("direction") or "BUY").upper()
-        side       = OrderSide.BUY if "BUY" in raw_side else OrderSide.SELL
-        quantity   = float(data.get("quantity") or data.get("open_quantity") or 0)
-        raw_type   = str(data.get("order_type") or "market").lower()
-        order_type = (
-            OrderType.STOP  if "stop"  in raw_type else
-            OrderType.LIMIT if "limit" in raw_type else
-            OrderType.MARKET
-        )
-        # Trigger price: stop_price or limit_price field
-        price = float(
-            data.get("stop_price") or data.get("limit_price") or
-            data.get("trigger_price") or 0
-        )
-        raw_status = str(data.get("status") or "").upper()
-        status_map = {
-            "OPEN":      OrderStatus.SUBMITTED,
-            "CREATED":   OrderStatus.SUBMITTED,
-            "PENDING":   OrderStatus.SUBMITTED,
-            "ACTIVE":    OrderStatus.SUBMITTED,
-            "CANCELLED": OrderStatus.CANCELLED,
-            "FILLED":    OrderStatus.FILLED,
-            "SETTLED":   OrderStatus.FILLED,
-            "REJECTED":  OrderStatus.REJECTED,
-            "EXPIRED":   OrderStatus.REJECTED,
-        }
-        status = status_map.get(raw_status, OrderStatus.SUBMITTED)
-        ts_str = data.get("created_at") or data.get("last_event_datetime") or ""
-        try:
-            ts = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00")) if ts_str else dt.datetime.now(dt.timezone.utc)
-        except ValueError:
-            ts = dt.datetime.now(dt.timezone.utc)
-        return Order(
-            id=order_id, symbol=symbol,
-            order_type=order_type, side=side,
-            quantity=quantity, price=price, status=status,
-            placed_timestamp=ts, filled_timestamp=None, cancelled_timestamp=None,
-            average_fill_price=0.0, fees=0.0, leverage=1.0,
-            broker_order_id=order_id, broker_specific_data=data,
-        )
+        """Map a transactions item (pre-fill status) to an Order entity."""
+        order = self._map_order_data(data)
+        # Preserve limit/stop price if set (map_order_data derives price from amount/qty)
+        limit_price = float(data.get("limit_price") or 0)
+        stop_price  = float(data.get("stop_price")  or 0)
+        if stop_price:
+            order.order_type = OrderType.STOP
+            order.price      = stop_price
+        elif limit_price:
+            order.order_type = OrderType.LIMIT
+            order.price      = limit_price
+        # Resolve ISIN → ticker so symbol comparisons work
+        isin = str(data.get("isin") or "").upper()
+        if isin and isin in self._isin_ticker_cache:
+            order.symbol = self._isin_ticker_cache[isin]
+        return order
 
     # ── Quotes ────────────────────────────────────────────────────────────────
 
@@ -1051,8 +1075,11 @@ class ScalableBroker(BaseBroker):
             self._isin_cache[isin.upper()]  = isin
             self._isin_name_cache[isin.upper()] = name
 
+        # Prefer ticker from ticker_isin.json over the human-readable name
+        symbol = self._isin_ticker_cache.get(isin.upper(), name)
+
         return Position(
-            id=isin, symbol=name, side=TradeSide.LONG,
+            id=isin, symbol=symbol, side=TradeSide.LONG,
             open_date=dt.datetime.now(dt.timezone.utc), close_date=None,
             quantity=quantity, average_price=avg_price, leverage=1.0,
             market_value=value,

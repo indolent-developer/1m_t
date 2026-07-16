@@ -72,13 +72,15 @@ class PriceHistoryService:
         timeframe: TimeFrame,
         start: dt.date,
         end: dt.date,
+        force_fresh: bool = False,
     ) -> list[OHLCData]:
         tf_str = _TF_ABBREV.get(timeframe, timeframe.value)
         key = f"price_history_tf_{tf_str}_{self._fetcher_name}_start_{start}_end_{end}"
 
-        cached = await self._cache.load(key, category=symbol)
-        if cached is not None:
-            return [OHLCData.from_dict(b) for b in cached]
+        if not force_fresh:
+            cached = await self._cache.load(key, category=symbol)
+            if cached is not None:
+                return [OHLCData.from_dict(b) for b in cached]
 
         start_dt = dt.datetime.combine(start, dt.time.min)
         end_dt   = dt.datetime.combine(end,   dt.time.max)
@@ -99,8 +101,9 @@ class PriceHistoryService:
                 ttl=ttl,
             )
             logger.info(
-                "PriceHistoryService: [%s] %s %s — %d bars fetched and cached (TTL %ds)",
+                "PriceHistoryService: [%s] %s %s — %d bars fetched and cached (TTL %ds)%s",
                 self._fetcher_name, symbol, tf_str, len(bars), ttl,
+                " [force_fresh]" if force_fresh else "",
             )
         return bars or []
 
@@ -120,7 +123,19 @@ class PriceHistoryService:
         self,
         symbol: str,
         timeframe: TimeFrame = TimeFrame.MINUTE_5,
+        force_fresh: bool = False,
     ) -> list[OHLCData]:
-        """Today's intraday bars (short TTL cache). Returns oldest→newest."""
-        today = dt.date.today()
-        return await self.get_bars(symbol, timeframe, today, today)
+        """Today's intraday bars including pre-market. Returns oldest→newest.
+
+        Uses a 2-day window so the result is shared with IndicatorProvider's
+        cache entry and is never empty at startup while today's narrow range
+        hasn't populated yet on FMP.  Bars are filtered to today's ET date.
+
+        force_fresh=True bypasses Redis cache — use in HOD/LOD refresh to avoid
+        stale LOD values when cache TTL and refresh cadence are both 5 minutes.
+        """
+        import pytz
+        et_today = dt.datetime.now(pytz.timezone("America/New_York")).date()
+        start    = et_today - dt.timedelta(days=1)
+        bars     = await self.get_bars(symbol, timeframe, start, et_today, force_fresh=force_fresh)
+        return [b for b in bars if b.time and b.time.date() == et_today]

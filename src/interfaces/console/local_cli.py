@@ -57,10 +57,11 @@ from adapters.brokers.base_broker     import BaseBroker
 from core.config.config_loader        import ConfigLoader
 
 from interfaces.console.cmd_account  import cmd_account, cmd_positions, cmd_orders, cmd_pnl, cmd_quote, cmd_fills
-from interfaces.console.cmd_trading  import cmd_trade, cmd_move, cmd_close, cmd_closeall, cmd_pending, cmd_cancel, cmd_size
-from interfaces.console.cmd_monitor       import cmd_ind, cmd_indp, cmd_scan, cmd_news, cmd_ml
+from interfaces.console.cmd_trading  import cmd_trade, cmd_move, cmd_close, cmd_closeall, cmd_pending, cmd_cancel, cmd_size, cmd_rotate, cmd_restore, cmd_rotations, cmd_rotate_suggest
+from interfaces.console.cmd_monitor       import cmd_ind, cmd_indp, cmd_scan, cmd_news, cmd_ml, cmd_profile
 from interfaces.console.cmd_search        import cmd_search
 from interfaces.console.cmd_trade_helper  import cmd_trade_helper
+from interfaces.console.cmd_analyze_portfolio import cmd_analyze_portfolio
 from interfaces.console.cmd_sym           import cmd_sym
 
 
@@ -78,6 +79,7 @@ HELP = """
   /broker     — show or switch broker
 
   /th SYMBOL  — deep pre-trade analysis (technicals + news + LLM verdict)
+  /analyzep [delay_s] — run /th for every portfolio symbol, save to data/ai_analysis/portfolio/<date>/
 
   /h account | trading | monitor | broker   for details
 """.strip()
@@ -85,6 +87,7 @@ HELP = """
 HELP_ACCOUNT = """
   /a  /account                   — Account snapshot
   /p  /positions [SYMBOL]        — Open positions
+  /p  list                       — Symbols only, comma-separated
   /o  /orders                    — Recent orders
   /pnl                           — Open P&L
   /fills SYMBOL [N]              — Fill history + realized P&L (last N trades)
@@ -103,6 +106,10 @@ HELP_TRADING = """
       /sell WOLF 50% @4.00        take-profit
 
   /move SYMBOL1 SIZE SYMBOL2     — Sell → wait for fill → buy
+  /rotate FROM SIZE TO [+X%]    — Sell FROM, buy TO; optionally set TP at +X%
+  /restore FROM TO [QTY]        — Sell all FROM, buy back QTY of TO (QTY auto if /rotate was used)
+  /rotations                     — List open rotation records
+  /rsuggest [TF]                 — Momentum rotation recommendation (FROM/TO pairs + /rotate commands)
   /close SYMBOL                  — Market-close full position
   /closeall [PCT%]               — Close all (or trim by PCT%)
   /pending  (/op)                — Resting stop/limit orders
@@ -154,10 +161,10 @@ _COMMANDS = [
     "/pnl", "/q", "/quote", "/fills",
     "/buy", "/b", "/sell", "/s", "/move", "/mv",
     "/c", "/close", "/ca", "/closeall",
-    "/pending", "/op", "/cancel", "/x", "/size",
+    "/pending", "/op", "/cancel", "/x", "/size", "/rotate", "/restore", "/rotations", "/rsuggest", "/rs",
     "/ind", "/indp", "/scan", "/news", "/n",
-    "/ml", "/search", "/sr", "/th", "/tradehelp",
-    "/sym", "/broker",
+    "/ml", "/search", "/sr", "/th", "/tradehelp", "/analyzep",
+    "/sym", "/broker", "/profile",
 ]
 
 
@@ -241,8 +248,6 @@ async def run(broker: BaseBroker) -> None:
         if ml_tasks:
             await asyncio.gather(*[e["task"] for e in ml_tasks.values()], return_exceptions=True)
         ml_tasks.clear()
-        from data_fetchers.finnhub_ws_data_fetcher import shutdown_shared_fetcher
-        await shutdown_shared_fetcher()
 
     loop = asyncio.get_event_loop()
 
@@ -288,6 +293,10 @@ async def run(broker: BaseBroker) -> None:
         elif cmd in ("buy",  "b"):             await cmd_trade(broker, "buy",  args)
         elif cmd in ("sell", "s"):             await cmd_trade(broker, "sell", args)
         elif cmd in ("move", "mv"):            await cmd_move(broker, args)
+        elif cmd == "rotate":                  await cmd_rotate(broker, args)
+        elif cmd == "restore":                 await cmd_restore(broker, args)
+        elif cmd == "rotations":               await cmd_rotations(args)
+        elif cmd in ("rsuggest", "rs"):        await cmd_rotate_suggest(broker, args)
         elif cmd in ("c", "close"):            await cmd_close(broker, args)
         elif cmd in ("ca", "closeall"):        await cmd_closeall(broker, args)
         elif cmd in ("pending", "op"):         await cmd_pending(broker, args)
@@ -299,6 +308,7 @@ async def run(broker: BaseBroker) -> None:
         elif cmd in ("indp", "ind_port"):      await cmd_indp(broker, args)
         elif cmd == "scan":                    await cmd_scan(args)
         elif cmd in ("news", "n"):             await cmd_news(args)
+        elif cmd == "profile":                 await cmd_profile(args)
         elif cmd in ("ml", "monitor-levels", "monitor_levels"):
                                                await cmd_ml(broker, args, ml_tasks)
 
@@ -310,6 +320,7 @@ async def run(broker: BaseBroker) -> None:
 
         # ── Trade helper ──────────────────────────────────────────────────────
         elif cmd in ("th", "tradehelp"):       await cmd_trade_helper(broker, args)
+        elif cmd == "analyzep":                await cmd_analyze_portfolio(broker, args)
 
         # ── Broker switch ─────────────────────────────────────────────────────
         elif cmd == "broker":

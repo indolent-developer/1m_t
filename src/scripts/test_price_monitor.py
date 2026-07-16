@@ -81,7 +81,8 @@ async def main() -> None:
     bus = LocalEventBus()
     bus.subscribe(BrokerEvent.QUOTE_UPDATE, on_tick)
 
-    monitor = PriceMonitor(symbols=symbols, bus=bus, poll_interval=15, source=source)
+    from core.config.config_models import PriceMonitorConfig
+    monitor = PriceMonitor(symbols=symbols, bus=bus, config=PriceMonitorConfig(source=source, poll_interval=15))
 
     src_tag = f"  source={source}" if source != "auto" else ""
     print(f"Monitoring {len(symbols)} symbols for {RUN_SECONDS}s: {', '.join(symbols)}{src_tag}")

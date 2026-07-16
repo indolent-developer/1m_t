@@ -15,7 +15,7 @@ Design notes (from prompt review):
 from __future__ import annotations
 import json
 
-SYSTEM_PROMPT = """You are an experienced discretionary trader doing pre-entry analysis. We hold NO position. Assess whether an entry is attractive now, which direction, and at what levels.
+_SYSTEM_BASE = """You are an experienced discretionary trader. {holding_context}
 
 Style: intraday momentum with structure-based entries. Prefer confirmation over anticipation. A setup needs roughly 1.5R or better to be worth taking. WATCH is not a hedge — it must come with a specific, observable trigger. ENTER and AVOID are both legitimate; do not default to the middle.
 
@@ -40,12 +40,41 @@ Fill the output schema in the exact field order given — analysis fields first,
 Output ONLY valid JSON matching the schema. No preamble, no markdown."""
 
 
+def build_system_prompt(own_position: dict | None = None) -> str:
+    """Return the system prompt, framed for position management when we hold the symbol."""
+    if own_position:
+        side    = own_position["side"].upper()
+        qty     = int(own_position["quantity"])
+        avg     = own_position["avg_price"]
+        pct     = own_position["upnl_pct"]
+        upnl    = own_position["upnl"]
+        weight  = own_position["weight_pct"]
+        ctx = (
+            f"We are MANAGING an existing {side} position: "
+            f"{qty} sh, avg ${avg:.2f}, weight {weight:.1f}%, "
+            f"P&L {pct:+.1f}% (${upnl:+.0f}). "
+            f"Your primary deliverable is `position_action`: give a clear "
+            f"HOLD / ADD / TRIM / EXIT call with the size to act on and a crisp reason. "
+            f"If trimming or exiting, state what level or condition would let you re-enter."
+        )
+    else:
+        ctx = "We hold NO position in this name. Assess whether an entry is attractive now, which direction, and at what levels."
+    return _SYSTEM_BASE.format(holding_context=ctx)
+
+
+# Keep for backwards compatibility (used when no position is held)
+SYSTEM_PROMPT = build_system_prompt()
+
+
 USER_TEMPLATE = """=== STOCK ===
 {symbol} | {company} | {sector} | {mkt_cap} | beta {beta}
 {description_300}
 
 === NOW ===
 {timestamp} ET | {weekday} | {session_phase} | bars through {last_bar_time}
+
+=== LIVE QUOTE ===
+{live_quote}{bar_staleness_warn}
 
 === DAILY ===
 Px {price} | ATR14 {atr} ({atr_pct}%) | RSI {rsi} | ADX {adx} {trend_label}
@@ -76,11 +105,17 @@ VIX {vix} ({vix_regime})
 {portfolio_lines}
 Avg 60d corr of candidate to book: {avg_corr} | Net book bias: {net_bias}
 
+=== OPEN POSITION (THIS SYMBOL) ===
+{open_position_section}
+
 === EARNINGS ===
 {days_to_earnings} days{blackout_flag}
 
 === MACRO CALENDAR (US, today+5d) ===
 {econ_calendar}
+
+=== ANALYST RATINGS (14d) ===
+{analyst_ratings}
 
 === HARD EVENTS ===
 {hard_events}
@@ -102,12 +137,29 @@ Avg 60d corr of candidate to book: {avg_corr} | Net book bias: {net_bias}
                    "note": "1 sentence — thematic/factor overlap with holdings, incl. anything the correlation number misses"}},
  "hold_plan": {{"horizon": "EOD|1-3 days",
                "carry_condition": "must be true at 15:50 ET to hold overnight, else flatten"}},
+ "position_action": {{"action": "HOLD|ADD|TRIM|EXIT", "size_pct": 0-100,
+                      "reason": "1 sentence", "re_entry": "level or condition to re-enter after trim/exit, else null"}},
  "verdict": "ENTER|WATCH|AVOID",
  "side_bias": "long|short|neutral",
  "confidence": "high|medium|low",
  "timeframe": "scalp|intraday|swing",
  "synthesis": "2-3 sentences, honest read incl. what the data misses"
-}}"""
+}}
+Note: fill position_action only when an open position is shown above; otherwise set it to null."""
+
+
+def format_open_position_section(own_position: dict | None) -> str:
+    """Build the OPEN POSITION section for the prompt, or '(none)' when flat."""
+    if not own_position:
+        return "(none — fresh entry analysis)"
+    p = own_position
+    return (
+        f"{p['side'].upper()} {int(p['quantity'])} sh"
+        f" | avg ${p['avg_price']:.2f}"
+        f" | mkt ${p['market_value']:,.0f}"
+        f" | weight {p['weight_pct']:.1f}%"
+        f" | P&L {p['upnl_pct']:+.1f}% (${p['upnl']:+.0f})"
+    )
 
 
 def format_portfolio_lines(positions: list[dict],

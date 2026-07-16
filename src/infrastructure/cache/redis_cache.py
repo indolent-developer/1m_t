@@ -82,6 +82,11 @@ class RedisCache:
         except Exception:
             return -2
 
+    async def ping(self) -> None:
+        """Raises if Redis is unreachable."""
+        r = await self._get_client()
+        await r.ping()
+
     async def close(self) -> None:
         if self._client:
             await self._client.aclose()

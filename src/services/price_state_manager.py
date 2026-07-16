@@ -35,7 +35,7 @@ from core.entities.level_event import LevelEvent
 from core.entities.market_data import PriceTick
 from core.entities.time_frame import TimeFrame
 from services.indicator_provider import IndicatorProvider
-from services.level_tracker import LevelTracker
+from services.level_tracker import LevelTracker, DEFAULT_MIN_ATR_PCT
 from services.price_history_service import PriceHistoryService
 
 logger = getLogger(__name__)
@@ -51,6 +51,7 @@ class PriceStateManager(BaseSubscriber):
         atr_period: int = 14,
         band_timeframe: TimeFrame = TimeFrame.MINUTE_5,
         band_mult: float = 0.3,
+        min_atr_pct: float = DEFAULT_MIN_ATR_PCT,
         dwell_seconds: int = 120,
         break_confirm_seconds: int = 60,
         break_confirm_ticks: int = 3,
@@ -74,6 +75,7 @@ class PriceStateManager(BaseSubscriber):
                     level=lvl,
                     indicator_provider=self._provider,
                     band_mult=band_mult,
+                    min_atr_pct=min_atr_pct,
                     dwell_seconds=dwell_seconds,
                     atr_period=atr_period,
                     break_confirm_seconds=break_confirm_seconds,

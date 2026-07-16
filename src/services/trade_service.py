@@ -22,7 +22,10 @@ def parse_trigger(token: str) -> dict:
         else:
             mult_s, tf = atr_part, "1m"
         return {"kind": "atr", "mult": float(mult_s), "tf": tf.lower()}
-    return {"kind": "price", "usd": float(val)}
+    force_usd = val.startswith("$")
+    if force_usd:
+        val = val[1:]
+    return {"kind": "price", "usd": float(val), "force_usd": force_usd}
 
 
 def calc_quantity(

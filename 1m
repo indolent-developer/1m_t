@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# 1m — master CLI for the 1m trading system
+# Usage: ./1m <command> [args...]   |   ./1m help [command]
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPTS="$REPO_ROOT/run_scripts"
+
+# ── colour helpers ─────────────────────────────────────────────────────────────
+_bold()  { printf '\033[1m%s\033[0m' "$*"; }
+_cyan()  { printf '\033[36m%s\033[0m' "$*"; }
+_green() { printf '\033[32m%s\033[0m' "$*"; }
+_dim()   { printf '\033[2m%s\033[0m' "$*"; }
+
+# ── command registry ───────────────────────────────────────────────────────────
+# Each entry: "command|script|one-line description"
+_COMMANDS=(
+  "monitor|run_live_monitor.sh|Start the live monitor (price feed + scanners + Telegram alerts)"
+  "scan post-market|run_post_market_scanner.sh|Run post-market movers scan → data/daily_morning/post-market-movers/"
+  "scan pre-market|run_pre_market_scanner.sh|Run pre-market movers scan"
+  "scan pre-market-scalp|run_pre_market_scalp_scanner.sh|Run pre-market scalp scan"
+  "prompt|run_prompt.sh|Generate a morning analysis prompt (default: prompt 2 / pre-market)"
+  "scheduler|run_scheduler.sh|Start the morning routine scheduler daemon"
+  "snapshot|run_snapshot.sh|Instant account snapshot — positions, qty, unrealised P&L saved to data/snapshots/"
+  "eod|run_eod_report.sh|End-of-day portfolio report (add --telegram to send to Telegram)"
+  "bot|run_telegram_bot.sh|Start the Telegram bot"
+  "price-monitor|run_price_monitor.sh|Start the standalone price monitor"
+  "local|run_local.sh|Open local console CLI"
+)
+
+# ── help ───────────────────────────────────────────────────────────────────────
+_show_help() {
+  echo
+  _bold "1m — trading system CLI"
+  echo
+  echo "  $(_cyan "Usage:") ./1m <command> [args...]"
+  echo "  $(_cyan "Help:")  ./1m help [command]"
+  echo
+  _bold "Commands:"
+  echo
+  for entry in "${_COMMANDS[@]}"; do
+    IFS='|' read -r cmd script desc <<< "$entry"
+    printf "  %-28s %s\n" "$(_green "$cmd")" "$desc"
+  done
+  echo
+  _bold "Examples:"
+  echo
+  _dim "  ./1m monitor --list scanners"
+  _dim "  ./1m scan post-market --min-pmchg 3"
+  _dim "  ./1m prompt --prompt 2"
+  _dim "  ./1m prompt --prompt 1 --date 2026-06-17"
+  _dim "  ./1m snapshot"
+  _dim "  ./1m eod --telegram"
+  _dim "  ./1m help prompt"
+  echo
+}
+
+_show_command_help() {
+  local target="$*"
+  for entry in "${_COMMANDS[@]}"; do
+    IFS='|' read -r cmd script desc <<< "$entry"
+    if [[ "$cmd" == "$target" ]]; then
+      local path="$SCRIPTS/$script"
+      echo
+      _bold "$cmd"
+      echo "  $desc"
+      echo "  $(_dim "script: run_scripts/$script")"
+      echo
+      if [[ -f "$path" ]]; then
+        # Forward --help to the underlying Python script
+        bash "$path" --help 2>&1 || true
+      else
+        echo "  Script not found: $path"
+      fi
+      echo
+      return 0
+    fi
+  done
+  echo "  Unknown command: $(_bold "$target"). Run $(_cyan "./1m help") to see all commands."
+  return 1
+}
+
+# ── dispatch ───────────────────────────────────────────────────────────────────
+if [[ $# -eq 0 ]]; then
+  _show_help
+  exit 0
+fi
+
+# "help" or "help <command>"
+if [[ "$1" == "help" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    _show_help
+  else
+    _show_command_help "$@"
+  fi
+  exit 0
+fi
+
+# Match command (may be two words e.g. "scan post-market")
+CMD="$1"
+shift
+# Check for two-word commands
+if [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
+  TWO_WORD="$CMD $1"
+  for entry in "${_COMMANDS[@]}"; do
+    IFS='|' read -r cmd script _desc <<< "$entry"
+    if [[ "$cmd" == "$TWO_WORD" ]]; then
+      shift   # consume second word
+      exec bash "$SCRIPTS/$script" "$@"
+    fi
+  done
+fi
+
+# Single-word match
+for entry in "${_COMMANDS[@]}"; do
+  IFS='|' read -r cmd script _desc <<< "$entry"
+  if [[ "$cmd" == "$CMD" ]]; then
+    exec bash "$SCRIPTS/$script" "$@"
+  fi
+done
+
+echo "  Unknown command: $(_bold "$CMD"). Run $(_cyan "./1m help") to see all commands."
+exit 1

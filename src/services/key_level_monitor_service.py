@@ -40,6 +40,9 @@ Usage
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import datetime as dt
+from datetime import datetime, timezone
 from core.utils.log_helper import getLogger
 from typing import Optional
 
@@ -52,10 +55,32 @@ from core.entities.market_data import PriceTick
 from core.entities.time_frame import TimeFrame
 from services.indicator_provider import IndicatorProvider
 from services.key_level_service import KeyLevelService, KeyLevels
-from services.level_tracker import LevelTracker
+from services.level_tracker import LevelTracker, effective_atr, DEFAULT_MIN_ATR_PCT
 from services.price_history_service import PriceHistoryService
 
 logger = getLogger(__name__)
+
+_BOUNCE_TIMEOUT_SECS  = 300   # cancel pending confirmation after 5 min
+_ST_LENGTH            = 7
+_ST_MULTIPLIER        = 3.0
+
+# Events that require two-stage bounce confirmation before being emitted
+_PARK_EVENTS = {
+    ("LOD", LevelEvent.BOUNCE),
+    ("HOD", LevelEvent.BREAK_BELOW),
+    ("LOD", LevelEvent.BREAK_ABOVE),   # "reversed LOD" — same reversal gate as BOUNCE
+}
+
+
+@dataclass
+class _PendingBounce:
+    evt:          PriceLevelEvent
+    direction:    int    # +1 = price must go UP (LOD), -1 = price must go DOWN (HOD)
+    target_price: float  # 1% from zone boundary in the break direction
+    st_at_bounce: Optional[int]   # supertrend direction when bounce was first detected
+    started:      datetime
+    zone_lo:      float
+    zone_hi:      float
 
 
 class KeyLevelMonitorService(BaseSubscriber):
@@ -76,10 +101,11 @@ class KeyLevelMonitorService(BaseSubscriber):
         band_timeframe: TimeFrame = TimeFrame.MINUTE_5,
         band_mult: float = 0.3,
         atr_period: int = 14,
+        min_atr_pct: float = DEFAULT_MIN_ATR_PCT,
         # LevelTracker confirmation params
         dwell_seconds: int = 120,
-        break_confirm_seconds: int = 60,
-        break_confirm_ticks: int = 3,
+        break_confirm_seconds: int = 30,
+        break_confirm_ticks: int = 2,
         break_max_zone_dwell_seconds: int = 300,
         false_break_window_seconds: int = 180,
         false_break_confirm_seconds: int = 15,
@@ -96,9 +122,16 @@ class KeyLevelMonitorService(BaseSubscriber):
             timeframe=band_timeframe,
             default_period=atr_period,
         )
+        self._provider_1m = IndicatorProvider(
+            history=history_service,
+            symbols=self._symbols,
+            timeframe=TimeFrame.MINUTE_1,
+            default_period=atr_period,
+        )
         self._tracker_cfg = dict(
             band_mult=band_mult,
             atr_period=atr_period,
+            min_atr_pct=min_atr_pct,
             dwell_seconds=dwell_seconds,
             break_confirm_seconds=break_confirm_seconds,
             break_confirm_ticks=break_confirm_ticks,
@@ -115,10 +148,15 @@ class KeyLevelMonitorService(BaseSubscriber):
         self._key_levels:       dict[str, KeyLevels]          = {}
         self._label_map:        dict[str, dict[float, str]]   = {}
 
-        self._hod_lod_task:   Optional[asyncio.Task] = None
-        self._provider_task:  Optional[asyncio.Task] = None
+        self._hod_lod_task:  Optional[asyncio.Task] = None
+        self._provider_task: Optional[asyncio.Task] = None
         self._add_symbol_lock = asyncio.Lock()
         self._adding_symbols: set[str] = set()
+
+        # level_value → datetime when price last entered that level's zone (HOD/LOD only)
+        self._level_touch_times: dict[str, dict[float, datetime]] = {}
+        # Two-stage bounce confirmation: symbol → pending confirmation
+        self._pending_bounces: dict[str, _PendingBounce] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -140,6 +178,7 @@ class KeyLevelMonitorService(BaseSubscriber):
         self._subscribe(BrokerEvent.QUOTE_UPDATE, self._on_tick)
         self._hod_lod_task  = asyncio.create_task(self._hod_lod_refresh_loop())
         self._provider_task = asyncio.create_task(self._provider.refresh_loop())
+        # _provider_1m is loaded on-demand only when a bounce is parked
 
     async def stop(self) -> None:
         self.detach()
@@ -215,9 +254,22 @@ class KeyLevelMonitorService(BaseSubscriber):
         if not isinstance(payload.data, PriceTick):
             return
         tick   = payload.data
+        now    = (
+            datetime.fromtimestamp(tick.timestamp / 1000, tz=timezone.utc)
+            if tick.timestamp else datetime.now(timezone.utc)
+        )
         labels = self._label_map.get(tick.symbol, {})
 
-        # ── Run existing trackers first so BREAK_BELOW fires on the old LOD ──
+        # ── Track HOD/LOD zone entries ────────────────────────────────────────
+        self._update_hod_lod_touch(tick.symbol, tick.price, now)
+
+        # ── Check any pending bounce confirmation for this symbol ─────────────
+        confirmed = await self._check_pending_bounce(tick.symbol, tick.price, now)
+        if confirmed:
+            _log_event(confirmed, labels)
+            await self._bus.emit(confirmed)
+
+        # ── Run trackers ──────────────────────────────────────────────────────
         trackers = (
             self._static_trackers.get(tick.symbol, []) +
             self._hod_lod_trackers.get(tick.symbol, [])
@@ -227,31 +279,133 @@ class KeyLevelMonitorService(BaseSubscriber):
                 evt.label = labels.get(round(evt.level, 4), "")
                 if not _event_makes_sense(evt.event, evt.label):
                     continue
-                _log_event(evt, labels)
-                await self._bus.emit(evt)
+                if evt.label in ("HOD", "LOD"):
+                    evt.level_touched_at = self._level_touch_times.get(tick.symbol, {}).get(round(evt.level, 4))
 
-        # ── Update HOD/LOD in real-time from the tick stream ─────────────────
-        kl = self._key_levels.get(tick.symbol)
-        if kl and tick.price:
-            hod_moved = tick.price > kl.hod_5min_ago + 0.001
-            lod_moved = tick.price < kl.lod_5min_ago - 0.001
-            if hod_moved or lod_moved:
-                if hod_moved:
-                    kl.hod_5min_ago = round(tick.price, 4)
-                if lod_moved:
-                    kl.lod_5min_ago = round(tick.price, 4)
-                self._hod_lod_trackers[tick.symbol] = self._make_trackers(
-                    tick.symbol, kl.hod_lod_levels()
-                )
-                self._label_map[tick.symbol] = kl.labels()
+                if (evt.label, evt.event) in _PARK_EVENTS:
+                    await self._park_bounce(tick.symbol, evt)
+                    _log_event(evt, labels)   # log but hold — emit only after confirmation
+                else:
+                    _log_event(evt, labels)
+                    await self._bus.emit(evt)
+
+    def _update_hod_lod_touch(self, symbol: str, price: float, now: datetime) -> None:
+        if not price:
+            return
+        atr = self._provider.compute(symbol, "atr", length=self._tracker_cfg.get("atr_period", 14))
+        if not atr:
+            return
+        atr   = effective_atr(atr, price, self._tracker_cfg.get("min_atr_pct", DEFAULT_MIN_ATR_PCT))
+        band  = atr * self._tracker_cfg.get("band_mult", 0.3)
+        touch = self._level_touch_times.setdefault(symbol, {})
+        for tracker in self._hod_lod_trackers.get(symbol, []):
+            if tracker.level - band <= price <= tracker.level + band:
+                touch[round(tracker.level, 4)] = now
+
+    async def _park_bounce(self, symbol: str, evt: PriceLevelEvent) -> None:
+        direction    = 1 if evt.label == "LOD" else -1
+        target_price = evt.zone_lo * 1.01 if direction == 1 else evt.zone_hi * 0.99
+        await self._provider_1m.load_one(symbol)   # fresh 1m bars only when needed
+        st           = self._provider_1m.supertrend_direction(symbol, _ST_LENGTH, _ST_MULTIPLIER)
+        self._pending_bounces[symbol] = _PendingBounce(
+            evt=evt, direction=direction, target_price=target_price,
+            st_at_bounce=st, started=datetime.now(timezone.utc),
+            zone_lo=evt.zone_lo, zone_hi=evt.zone_hi,
+        )
+        logger.debug(
+            "KeyLevelMonitorService: %s parked %s [%s] — target=%.4f  st_at_bounce=%s",
+            symbol, evt.event.value, evt.label, target_price, st,
+        )
+
+    async def _check_pending_bounce(
+        self, symbol: str, price: float, now: datetime
+    ) -> Optional[PriceLevelEvent]:
+        pb = self._pending_bounces.get(symbol)
+        if pb is None:
+            return None
+
+        elapsed = (now - pb.started).total_seconds()
+
+        # ── Cancel: timeout ───────────────────────────────────────────────────
+        if elapsed > _BOUNCE_TIMEOUT_SECS:
+            del self._pending_bounces[symbol]
+            logger.debug("KeyLevelMonitorService: %s pending bounce timeout", symbol)
+            return None
+
+        # ── Cancel: price returned to zone ────────────────────────────────────
+        if pb.zone_lo <= price <= pb.zone_hi:
+            del self._pending_bounces[symbol]
+            logger.debug("KeyLevelMonitorService: %s pending bounce cancelled (price back in zone)", symbol)
+            return None
+
+        # ── Cancel: price drifted too far from zone (stale / already exhausted) ─
+        atr = self._provider.compute(symbol, "atr", length=self._tracker_cfg.get("atr_period", 14)) or 0
+        if atr > 0:
+            zone_dist = (
+                (price - pb.zone_hi) if pb.direction == 1   # LOD bounce: price above zone
+                else (pb.zone_lo - price)                    # HOD bounce: price below zone
+            )
+            if zone_dist > 5 * atr:
+                del self._pending_bounces[symbol]
                 logger.debug(
-                    "KeyLevelMonitorService: %s HOD/LOD → %.4f / %.4f (from tick)",
-                    tick.symbol, kl.hod_5min_ago, kl.lod_5min_ago,
+                    "KeyLevelMonitorService: %s pending bounce cancelled (%.4f is %.1f ATRs from zone)",
+                    symbol, price, zone_dist / atr,
                 )
+                return None
+
+        # ── Check gates ───────────────────────────────────────────────────────
+        price_ok = (
+            (pb.direction == 1  and price >= pb.target_price) or
+            (pb.direction == -1 and price <= pb.target_price)
+        )
+        if not price_ok:
+            return None
+
+        await self._provider_1m.load_one(symbol)   # refresh 1m so supertrend is current
+        st_now = self._provider_1m.supertrend_direction(symbol, _ST_LENGTH, _ST_MULTIPLIER)
+
+        # Normal confirmation: supertrend has flipped to agree with the bounce direction.
+        st_ok = (
+            st_now is not None and
+            pb.st_at_bounce is not None and
+            st_now != pb.st_at_bounce and
+            st_now == pb.direction
+        )
+
+        # Strong-price bypass: if price has already moved 2× ATR beyond the target,
+        # the bounce is confirmed by price action alone — don't wait for the trend flip.
+        price_gap    = abs(price - pb.target_price)
+        strong_price = atr > 0 and price_gap >= 2 * atr
+
+        if st_ok or strong_price:
+            del self._pending_bounces[symbol]
+            reason = "st_flip" if st_ok else "strong_price"
+            logger.info(
+                "KeyLevelMonitorService: %s bounce confirmed (%s) — %s [%s]  price=%.4f  st=%s",
+                symbol, reason, pb.evt.event.value, pb.evt.label, price, st_now,
+            )
+            return pb.evt
+
+        return None
+
 
     async def _hod_lod_refresh_loop(self) -> None:
+        import pytz
+        _ET = pytz.timezone("America/New_York")
+        _last_session_date: Optional[dt.date] = None
+
         while True:
             await asyncio.sleep(self._hod_lod_refresh)
+
+            now_et       = datetime.now(_ET)
+            session_date = now_et.date()
+
+            # Force-reset all HOD/LOD trackers at the start of each new ET session.
+            # This prevents overnight dwell state (17h+ zones) from carrying into
+            # the next day's open and delaying/corrupting break alerts.
+            new_session = _last_session_date is not None and session_date != _last_session_date
+            _last_session_date = session_date
+
             for symbol in list(self._symbols):
                 try:
                     existing = self._key_levels.get(symbol)
@@ -266,7 +420,7 @@ class KeyLevelMonitorService(BaseSubscriber):
                     hod_moved = abs(updated.hod_5min_ago - old_hod) > 0.001
                     lod_moved = abs(updated.lod_5min_ago - old_lod) > 0.001
 
-                    if not hod_moved and not lod_moved:
+                    if not hod_moved and not lod_moved and not new_session:
                         # Level unchanged — keep existing trackers so in-progress
                         # dwell/confirmation state is not thrown away.
                         logger.debug(

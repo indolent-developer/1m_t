@@ -16,7 +16,6 @@ Commands:
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import os
 import sys
@@ -26,36 +25,16 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from core.utils.log_helper import getLogger as _lh_getLogger, LK, set_log_context
-
-logger = _lh_getLogger(__name__, app_name="tg-bot")
-
-_SCRIPTS        = Path(__file__).resolve().parents[2] / "scripts" / "scanners"
-_IGNORE_PATH    = Path(__file__).resolve().parents[3] / "data" / "indp_ignore.json"
-_ML_LEVELS_PATH = Path(__file__).resolve().parents[3] / "data" / "ml_levels.json"
-
+from services.command_service import CommandService, CommandError
 from services.position_service import find_position as _find_position, get_position_for_ticker as _get_position_for_ticker
 from services.pnl_service import get_fills as _get_fills, calc_pnl as _calc_pnl
 
+logger = _lh_getLogger(__name__, app_name="tg-bot")
 
-# ── Portfolio indicator ignore list ───────────────────────────────────────────
-
-def _load_ignore() -> set:
-    if _IGNORE_PATH.exists():
-        try:
-            return set(json.loads(_IGNORE_PATH.read_text()))
-        except Exception:
-            pass
-    return set()
-
-
-def _save_ignore(entries: set) -> None:
-    _IGNORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _IGNORE_PATH.write_text(json.dumps(sorted(entries), indent=2))
+_ML_LEVELS_PATH = Path(__file__).resolve().parents[3] / "data" / "ml_levels.json"
 
 
 # ── Level monitor persistence ─────────────────────────────────────────────────
-# Format: {symbol: {"levels": [float, ...], "filters": [str, ...]}}
-# filters are LevelEvent.value strings, e.g. "break_above"
 
 def _load_ml_levels() -> dict:
     if _ML_LEVELS_PATH.exists():
@@ -69,20 +48,6 @@ def _load_ml_levels() -> dict:
 def _save_ml_levels(data: dict) -> None:
     _ML_LEVELS_PATH.parent.mkdir(parents=True, exist_ok=True)
     _ML_LEVELS_PATH.write_text(json.dumps(data, indent=2))
-
-
-def _is_ignored(pos, ignore: set, ticker: str = "") -> bool:
-    """Case-insensitive match against company name, ISIN, or resolved ticker."""
-    targets = {pos.symbol.lower(), (pos.id or "").lower()}
-    if ticker:
-        targets.add(ticker.lower())
-    lower_ignore = {e.lower() for e in ignore}
-    return bool(targets & lower_ignore)
-
-
-def _load_scanner(name: str):
-    path = _SCRIPTS / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(name, path)
     mod  = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -111,8 +76,8 @@ HELP_TEXT = """
 
 *Level Monitor*
 /ml  SYMBOL LEVEL [LEVEL ...] [filter ...]
-     Filters: break_up  break_down  bounce  reject  (default: all)
-     /ml APLD 41.5 break_down      — alert when APLD breaks below 41.5
+     Filters: break\_up  break\_down  bounce  reject  (default: all)
+     /ml APLD 41.5 break\_down      — alert when APLD breaks below 41.5
      /ml AAPL 200 210 bounce       — alert on bounces at 200 and 210
      /ml status [SYMBOL]           — current price + distance from watched levels
      /ml stop SYMBOL               — stop monitoring
@@ -208,34 +173,24 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: `/b SYMBOL SIZE`\nSIZE: N shares | eN euros | $N USD",
+            "Usage: `/b SYMBOL SIZE [@TRIGGER] [stop|limit]`\n"
+            "SIZE: N shares | N% | all | eN euros | $N USD",
             parse_mode="Markdown",
         )
         return
-    symbol = args[0].upper()
-    st     = args[1].lower()
+    symbol        = args[0].upper()
+    size_token    = args[1]
+    trigger_token = next((a for a in args[2:] if a.startswith("@")), None)
+    forced_type   = next((a.lower() for a in args[2:] if a.lower() in ("stop", "limit")), None)
     try:
-        from core.entities.broker_entities import OrderSide, OrderType
-        from services.fundamentals_service import FundamentalsService
-        svc = FundamentalsService(api_key=os.environ.get("FMP_API_KEY", ""))
-
-        if st.startswith("e"):
-            eur_amount = float(st[1:])
-            quote = await broker.get_quote(symbol)
-            qty   = max(1, int(eur_amount / float(quote.ask)))
-        elif st.startswith("$"):
-            usd_amount = float(st[1:])
-            rate       = await svc.get_fx_rate("USD", "EUR")
-            quote      = await broker.get_quote(symbol)
-            qty        = max(1, int(usd_amount * rate / float(quote.ask)))
-        else:
-            qty = int(float(st))
-
-        order = await broker.place_order(symbol, qty, OrderSide.BUY, OrderType.MARKET)
+        svc   = CommandService(broker)
+        order = await svc.buy(symbol, size_token, trigger_token, forced_type)
         await update.message.reply_text(
-            f"✅ BUY submitted: `{qty} {symbol}`\nOrder ID: `{order.broker_order_id}`",
+            f"✅ BUY submitted: `{order.quantity} {symbol}`\nOrder ID: `{order.broker_order_id}`",
             parse_mode="Markdown",
         )
+    except CommandError as e:
+        await update.message.reply_text(f"❌ {e}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
@@ -246,37 +201,26 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ No broker connected.")
         return
     args = context.args or []
-    if len(args) < 2:
+    if not args:
         await update.message.reply_text(
-            "Usage: `/s SYMBOL SIZE`\nSIZE: N shares | N% of position | all",
+            "Usage: `/s SYMBOL [SIZE] [@TRIGGER] [stop|limit]`\n"
+            "SIZE: N shares | N% | all (default: all)",
             parse_mode="Markdown",
         )
         return
-    symbol = args[0].upper()
-    st     = args[1].lower()
+    symbol        = args[0].upper()
+    size_token    = args[1] if len(args) > 1 and not args[1].startswith("@") else "all"
+    trigger_token = next((a for a in args[1:] if a.startswith("@")), None)
+    forced_type   = next((a.lower() for a in args[1:] if a.lower() in ("stop", "limit")), None)
     try:
-        from core.entities.broker_entities import OrderSide, OrderType
-
-        pos = await _find_position(broker, symbol)
-        if not pos:
-            await update.message.reply_text(
-                f"❌ No open position for `{symbol}`", parse_mode="Markdown"
-            )
-            return
-
-        if st == "all":
-            qty = int(pos.quantity)
-        elif st.endswith("%"):
-            pct = float(st[:-1])
-            qty = max(1, round(float(pos.quantity) * pct / 100))
-        else:
-            qty = int(float(st))
-
-        order = await broker.place_order(symbol, qty, OrderSide.SELL, OrderType.MARKET)
+        svc   = CommandService(broker)
+        order = await svc.sell(symbol, size_token, trigger_token, forced_type)
         await update.message.reply_text(
-            f"✅ SELL submitted: `{qty} {symbol}`\nOrder ID: `{order.broker_order_id}`",
+            f"✅ SELL submitted: `{order.quantity} {symbol}`\nOrder ID: `{order.broker_order_id}`",
             parse_mode="Markdown",
         )
+    except CommandError as e:
+        await update.message.reply_text(f"❌ {e}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
@@ -292,15 +236,14 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     symbol = args[0].upper()
     try:
-        position = await _find_position(broker, symbol)
-        if not position:
-            await update.message.reply_text(f"❌ No open position for `{symbol}`", parse_mode="Markdown")
-            return
-        ok = await broker.close_position(position.id)
-        if ok:
+        svc = CommandService(broker)
+        res = await svc.close(symbol)
+        if res.success:
             await update.message.reply_text(f"✅ Close order sent for `{symbol}`", parse_mode="Markdown")
         else:
-            await update.message.reply_text(f"❌ Close failed for `{symbol}`", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ Close failed for `{symbol}`: {res.error}", parse_mode="Markdown")
+    except CommandError as e:
+        await update.message.reply_text(f"❌ {e}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
@@ -311,18 +254,14 @@ async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("❌ No broker connected.")
         return
     try:
-        positions = await broker.get_positions()
-        if not positions:
+        svc     = CommandService(broker)
+        results = await svc.closeall()
+        if not results:
             await update.message.reply_text("📭 No open positions to close.")
             return
-        results = []
-        for pos in positions:
-            try:
-                await broker.close_position(pos.id)
-                results.append(f"✅ {pos.symbol}")
-            except Exception as e:
-                results.append(f"❌ {pos.symbol}: {e}")
-        await update.message.reply_text("*Close All*\n" + "\n".join(results), parse_mode="Markdown")
+        lines = [f"{'✅' if r.success else '❌'} {r.symbol}" + (f": {r.error}" if r.error else "")
+                 for r in results]
+        await update.message.reply_text("*Close All*\n" + "\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
@@ -343,54 +282,15 @@ async def cmd_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Invalid price.")
         return
     try:
-        position = await _find_position(broker, symbol)
-        if not position:
-            await update.message.reply_text(f"❌ No open position for `{symbol}`", parse_mode="Markdown")
-            return
-        ok = await broker.update_position_stops(position.id, stop_loss_price=price)
-        if ok:
-            await update.message.reply_text(
-                f"✅ Stop-loss updated: `{symbol}` @ `{price:,.4f}`", parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text("❌ Stop-loss not supported by this broker.")
+        svc = CommandService(broker)
+        await svc.stop_loss(symbol, price)
+        await update.message.reply_text(
+            f"✅ Stop-loss updated: `{symbol}` @ `{price:,.4f}`", parse_mode="Markdown"
+        )
+    except CommandError as e:
+        await update.message.reply_text(f"❌ {e}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
-
-
-async def _run_indicators(symbol: str, tf: str, extended: bool = False) -> str:
-    """Shared indicator logic used by both legacy and CommandHandler paths."""
-    import os
-    from services.fundamentals_service import FundamentalsService
-    from services.indicators_service import atr, rsi, ema, supertrend, adx
-
-    svc = FundamentalsService(api_key=os.environ.get("FMP_API_KEY", ""))
-    df  = await svc.get_ohlcv(symbol, timeframe=tf, limit=60, extended=extended)
-
-    atr_s   = atr(df, length=14)
-    rsi_s   = rsi(df, length=14)
-    ema8_s  = ema(df, length=8)
-    ema20_s = ema(df, length=20)
-    st_df   = supertrend(df, length=14, multiplier=2.5)
-    adx_s   = adx(df, length=20)
-
-    last_close = float(df["c"].iloc[-1])
-    last_atr   = atr_s.iloc[-1]
-    last_ts    = str(df["t"].iloc[-1])[:16]
-
-    data = {
-        "close":      round(last_close, 4),
-        "atr":        round(last_atr, 4) if last_atr is not None else None,
-        "atr_pct":    round(last_atr / last_close * 100, 2) if last_atr else None,
-        "rsi":        round(float(rsi_s.iloc[-1]), 2) if rsi_s.iloc[-1] is not None else None,
-        "ema8":       round(float(ema8_s.iloc[-1]), 4) if ema8_s.iloc[-1] is not None else None,
-        "ema20":      round(float(ema20_s.iloc[-1]), 4) if ema20_s.iloc[-1] is not None else None,
-        "st_value":   round(float(st_df["value"].iloc[-1]), 4) if not st_df["value"].isna().iloc[-1] else None,
-        "st_dir":     int(st_df["direction"].iloc[-1]) if not st_df["direction"].isna().iloc[-1] else None,
-        "st_flipped": bool(st_df["flipped"].iloc[-1]),
-        "adx":        round(float(adx_s.iloc[-1]), 1) if not adx_s.isna().iloc[-1] else None,
-    }
-    return data, last_ts
 
 
 async def cmd_ind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -405,85 +305,17 @@ async def cmd_ind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tf       = args[1].lower() if len(args) > 1 else "1d"
     extended = len(args) > 2 and args[2].lower() == "ext"
     ext_tag  = " +ext" if extended else ""
+    broker   = context.bot_data.get("broker")
     await update.message.reply_text(
         f"⏳ Calculating indicators for `{symbol}` ({tf}{ext_tag})…", parse_mode="Markdown"
     )
     try:
-        data, ts = await _run_indicators(symbol, tf, extended=extended)
+        svc    = CommandService(broker)
+        result = await svc.indicators(symbol, tf, extended=extended)
         from interfaces.telegram.formatters import v2_indicators
-        msg = v2_indicators(symbol, f"{tf}{ext_tag}", ts, data)
-        await update.message.reply_text(msg, parse_mode="MarkdownV2")
+        await update.message.reply_text(v2_indicators(result, tf_label=f"{tf}{ext_tag}"), parse_mode="MarkdownV2")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
-
-
-async def _run_portfolio_indicators(
-    broker,
-    tf: str = "1m",
-    extended: bool = True,
-) -> tuple:
-    """
-    Run indicators for all non-ignored portfolio positions concurrently.
-    Returns (results, skipped):
-      results = list of (ticker, pos_name, data, ts)
-      skipped = list of (pos_name, reason)
-    """
-    from services.fundamentals_service import FundamentalsService
-
-    positions = await broker.get_positions()
-    if not positions:
-        return [], []
-
-    ignore = _load_ignore()
-    active = [p for p in positions if not _is_ignored(p, ignore)]
-
-    svc = FundamentalsService(api_key=os.environ.get("FMP_API_KEY", ""))
-
-    skipped: list = []
-
-    # Separate valid-ISIN positions from obviously non-equity ones
-    to_resolve = []
-    for pos in active:
-        isin = pos.id or ""
-        if not isin or not isin[:2].isalpha() or len(isin) < 12:
-            skipped.append((pos.symbol, "no valid ISIN"))
-        else:
-            to_resolve.append(pos)
-
-    broker_id = getattr(broker, "broker_id", "")
-
-    # Resolve ISIN→ticker concurrently
-    async def _resolve(pos):
-        t = await svc.get_ticker_from_isin(pos.id, name_hint=pos.symbol, broker_id=broker_id)
-        return pos, t
-
-    resolved = await asyncio.gather(*[_resolve(p) for p in to_resolve])
-    ticker_map = []
-    for pos, ticker in resolved:
-        if not ticker:
-            skipped.append((pos.symbol, "ticker not found"))
-        elif _is_ignored(pos, ignore, ticker=ticker):
-            pass  # silently drop — user explicitly ignored this ticker
-        else:
-            ticker_map.append((pos, ticker))
-
-    async def _fetch_one(pos, ticker):
-        try:
-            data, ts = await _run_indicators(ticker, tf, extended=extended)
-            return (ticker, pos.symbol, data, ts, None)
-        except Exception as e:
-            return (ticker, pos.symbol, None, None, str(e))
-
-    raw = await asyncio.gather(*[_fetch_one(pos, ticker) for pos, ticker in ticker_map])
-
-    results = []
-    for ticker, pos_name, data, ts, err in raw:
-        if err:
-            skipped.append((pos_name, f"error: {str(err)[:60]}"))
-        else:
-            results.append((ticker, pos_name, data, ts))
-
-    return results, skipped
 
 
 async def cmd_indp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -492,19 +324,20 @@ async def cmd_indp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ No broker connected.")
         return
     args = context.args or []
+    svc  = CommandService(broker)
 
     if args and args[0].lower() == "ignore" and len(args) >= 2:
         name = " ".join(args[1:]).lower()
-        ig = _load_ignore(); ig.add(name); _save_ignore(ig)
+        svc.ignore_list_add(name)
         await update.message.reply_text(f"✅ Added `{name}` to ignore list", parse_mode="Markdown")
         return
     if args and args[0].lower() == "unignore" and len(args) >= 2:
         name = " ".join(args[1:]).lower()
-        ig = _load_ignore(); ig.discard(name); _save_ignore(ig)
+        svc.ignore_list_remove(name)
         await update.message.reply_text(f"✅ Removed `{name}` from ignore list", parse_mode="Markdown")
         return
     if args and args[0].lower() == "list":
-        ig = _load_ignore()
+        ig   = svc.ignore_list_get()
         body = "\n".join(f"  • {e}" for e in sorted(ig)) if ig else "_(empty)_"
         await update.message.reply_text(f"*Ignore list:*\n{body}", parse_mode="Markdown")
         return
@@ -514,13 +347,12 @@ async def cmd_indp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏳ Running portfolio indicators ({tf} +ext)…", parse_mode="Markdown"
     )
     try:
-        results, skipped = await _run_portfolio_indicators(broker, tf=tf, extended=True)
-        if not results and not skipped:
+        pr = await svc.portfolio_indicators(tf=tf, extended=True)
+        if not pr.rows and not pr.skipped:
             await update.message.reply_text("📭 No open positions.", parse_mode="Markdown")
             return
         from interfaces.telegram.formatters import v2_portfolio_indicators
-        msg = v2_portfolio_indicators(tf, results, skipped)
-        await update.message.reply_text(msg, parse_mode="MarkdownV2")
+        await update.message.reply_text(v2_portfolio_indicators(pr, tf), parse_mode="MarkdownV2")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
@@ -582,41 +414,19 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Usage: `/scan pm | pre | vol | spikes`", parse_mode="Markdown"
+            "Usage: `/scan pm | pre | vol | spikes | parabolic`", parse_mode="Markdown"
         )
         return
-
     scan_type = args[0].lower()
-    scanner_map = {
-        "pm":        ("run_post_market_scanner",  {}),
-        "pre":       ("run_pre_market_scanner",   {}),
-        "vol":       ("run_daily_high_volumes",   {"min_relvol": 3.0, "mode_label": "FIXED"}),
-        "spikes":    ("run_spikes_scanner",       {}),
-        "parabolic": ("run_parabolic_scanner",    {}),
-    }
-
-    if scan_type not in scanner_map:
-        await update.message.reply_text(
-            f"Unknown scanner `{scan_type}`. Use: pm | pre | vol | spikes | parabolic",
-            parse_mode="Markdown",
-        )
-        return
-
     await update.message.reply_text(f"⏳ Running `{scan_type}` scanner…", parse_mode="Markdown")
-
     try:
-        import io
-        from contextlib import redirect_stdout
-        mod_name, kwargs = scanner_map[scan_type]
-        mod    = _load_scanner(mod_name)
-        buf    = io.StringIO()
-        with redirect_stdout(buf):
-            mod.run_scanner(**kwargs)
-        output = buf.getvalue().strip()
-        # Telegram max message size is 4096 chars
+        svc    = CommandService(broker=None)
+        output = await svc.scan(scan_type)
         if len(output) > 4000:
             output = output[:4000] + "\n…(truncated)"
         await update.message.reply_text(f"```\n{output}\n```", parse_mode="Markdown")
+    except CommandError as e:
+        await update.message.reply_text(f"❌ {e}", parse_mode="Markdown")
     except Exception as e:
         logger.exception("Scanner error")
         await update.message.reply_text(f"❌ Scanner error: `{e}`", parse_mode="Markdown")
@@ -712,29 +522,22 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ No broker connected.")
         return
     try:
-        acc    = await broker.get_account_info()
-        cfg    = broker.config
-        loan   = getattr(cfg, "loan_amount",     50_000)
-        floor  = getattr(cfg, "equity_floor",    55_000)
-        max_dd = getattr(cfg, "hard_max_loss",   20_000)
-        start  = getattr(cfg, "starting_equity", 122_562)
+        svc = CommandService(broker)
+        r   = await svc.risk()
+        eq_emoji = "✅" if (not r.equity_floor or r.own_equity >= r.equity_floor) else "🚨"
+        dd_emoji = "✅" if (not r.hard_max_loss or r.drawdown < r.hard_max_loss)  else "🔴"
 
-        own_equity = acc.current_value - loan
-        drawdown   = start - acc.current_value if start else 0.0
-        dd_pct     = (drawdown / start * 100)  if start else 0.0
-
-        eq_emoji = "✅" if (not floor or own_equity >= floor) else "🚨"
-        dd_emoji = "✅" if (not max_dd or drawdown < max_dd)  else "🔴"
-
-        floor_line = f"{eq_emoji} Own equity:  `${own_equity:,.2f}` (floor `${floor:,.2f}`)\n" if floor else f"💰 Own equity:  `${own_equity:,.2f}`\n"
-        dd_line    = f"{dd_emoji} Drawdown:    `${drawdown:,.2f}` / `${max_dd:,.2f}` ({dd_pct:.1f}%)\n" if start else ""
-        loan_line  = f"🏦 Loan:        `${loan:,.2f}`\n"                                                  if loan  else ""
+        floor_line = (f"{eq_emoji} Own equity:  `${r.own_equity:,.2f}` (floor `${r.equity_floor:,.2f}`)\n"
+                      if r.equity_floor else f"💰 Own equity:  `${r.own_equity:,.2f}`\n")
+        dd_line    = (f"{dd_emoji} Drawdown:    `${r.drawdown:,.2f}` / `${r.hard_max_loss:,.2f}` ({r.dd_pct:.1f}%)\n"
+                      if r.starting_equity else "")
+        loan_line  = f"🏦 Loan:        `${r.loan:,.2f}`\n" if r.loan else ""
 
         msg = (
             f"📊 *Risk Metrics*\n\n"
             f"{floor_line}"
             f"{dd_line}"
-            f"💰 Total value: `${acc.current_value:,.2f}`\n"
+            f"💰 Total value: `${r.total_value:,.2f}`\n"
             f"{loan_line}"
         ).rstrip()
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -744,37 +547,32 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Fill history & P&L ───────────────────────────────────────────────────────
 
-def _fmt_fills(
-    symbol: str, result: dict, n_fills: int,
-    position_size: float = 0.0, broker_avg: float = 0.0,
-    current_bid: float = 0.0, unrealized: float = 0.0,
-) -> str:
-    """Format P&L summary as Markdown for Telegram."""
-    rows  = result["rows"]
-    lines = [f"*Fills — {symbol}*  \\({n_fills} trades\\)\n`{'─'*42}`"]
-    lines.append("`Date        Side  Qty      Price €`")
-    for row in rows:
-        ts = row["ts"].strftime("%Y-%m-%d") if row["ts"] else "—"
-        lines.append(
-            f"`{ts}  {row['side']:<5} {row['qty']:>7.0f}  {row['price']:>9.4f}`"
-        )
-    lines.append(f"`{'─'*42}`")
+def _fmt_fills(fs) -> str:
+    """Format a FillSummary as Markdown for Telegram."""
+    rows  = []
+    for o in fs.fills:
+        ts    = o.filled_timestamp.strftime("%Y-%m-%d") if o.filled_timestamp else "—"
+        side  = o.side.value.upper() if o.side else "?"
+        rows.append(f"`{ts}  {side:<5} {float(o.quantity):>7.0f}  {float(o.price or 0):>9.4f}`")
 
-    sign = lambda v: "+" if v >= 0 else ""
-    if result["buy_qty"] > 0:
-        lines.append(f"Avg buy:  `€{result['avg_buy']:.4f}`  \\({result['buy_qty']:.0f} shares\\)")
-    if result["sell_qty"] > 0:
-        lines.append(f"Avg sell: `€{result['avg_sell']:.4f}`  \\({result['sell_qty']:.0f} shares\\)")
-    if position_size > 0:
-        bid_s = f"  bid €{current_bid:.4f}" if current_bid else ""
-        avg_s = f" @ avg €{broker_avg:.4f}" if broker_avg else ""
-        lines.append(f"Open: *{position_size:.0f}* shares{avg_s}{bid_s}")
-        lines.append(f"Unrealized: `{sign(unrealized)}{unrealized:.2f}`")
+    sign   = lambda v: "+" if v >= 0 else ""
+    lines  = [f"*Fills — {fs.symbol}*  \\({len(fs.fills)} trades\\)\n`{'─'*42}`",
+              "`Date        Side  Qty      Price €`",
+              *rows,
+              f"`{'─'*42}`"]
+    if fs.buy_qty > 0:
+        lines.append(f"Avg buy:  `€{fs.avg_buy:.4f}`  \\({fs.buy_qty:.0f} shares\\)")
+    if fs.sell_qty > 0:
+        lines.append(f"Avg sell: `€{fs.avg_sell:.4f}`  \\({fs.sell_qty:.0f} shares\\)")
+    if fs.position_qty > 0:
+        bid_s = f"  bid €{fs.current_price:.4f}" if fs.current_price else ""
+        avg_s = f" @ avg €{fs.broker_avg:.4f}"   if fs.broker_avg   else ""
+        lines.append(f"Open: *{fs.position_qty:.0f}* shares{avg_s}{bid_s}")
+        lines.append(f"Unrealized: `{sign(fs.unrealized)}{fs.unrealized:.2f}`")
     else:
         lines.append("Position: *closed*")
-    realized = result["realized"]
-    total    = realized + unrealized
-    lines.append(f"Realized: `{sign(realized)}{realized:.2f}`")
+    total = fs.realized + fs.unrealized
+    lines.append(f"Realized: `{sign(fs.realized)}{fs.realized:.2f}`")
     lines.append(f"Total P&L: `{sign(total)}{total:.2f}`")
     return "\n".join(lines)
 
@@ -789,40 +587,16 @@ async def cmd_fills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         await update.message.reply_text("Usage: `/fills SYMBOL [N]`", parse_mode="Markdown")
         return
-
     symbol = args[0].upper()
     limit  = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
     await update.message.reply_text(f"⏳ Fetching fills for `{symbol}`…", parse_mode="Markdown")
     try:
-        fills = await _get_fills(broker, symbol)
-        if not fills:
+        svc = CommandService(broker)
+        fs  = await svc.fills(symbol, limit)
+        if not fs.fills:
             await update.message.reply_text(f"No filled orders found for `{symbol}`.", parse_mode="Markdown")
             return
-        if limit:
-            fills = fills[-limit:]
-
-        open_pos      = await _get_position_for_ticker(broker, symbol)
-        position_size = float(open_pos.quantity)      if open_pos else 0.0
-        broker_avg    = float(open_pos.average_price) if open_pos else 0.0
-        current_bid   = 0.0
-        try:
-            q           = await broker.get_quote(symbol)
-            current_bid = float(q.bid or q.mid or q.last or 0)
-        except Exception:
-            pass
-
-        result = _calc_pnl(fills, position_size, current_bid)
-
-        if position_size > 0 and broker_avg > 0 and current_bid > 0:
-            unrealized = (current_bid - broker_avg) * position_size
-        else:
-            unrealized = result["unrealized"]
-            broker_avg = result["avg_buy"]
-
-        await update.message.reply_text(
-            _fmt_fills(symbol, result, len(fills), position_size, broker_avg, current_bid, unrealized),
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(_fmt_fills(fs), parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
 
@@ -910,11 +684,14 @@ async def _ml_start_monitor(
     send_fn,
     break_fn=None,   # optional extra channel called only for BREAK_ABOVE / BREAK_BELOW
 ) -> tuple:
-    """Spin up PriceMonitor + PriceStateManager. Returns (task, monitor, manager)."""
+    """Spin up PriceStateManager. Returns (task, None, manager).
+
+    NOTE: price ticks must come from the external price monitor service
+    (run_live_monitor.py).  No PriceMonitor is started here.
+    """
     from adapters.events.local_event_bus import LocalEventBus
     from core.entities.level_event import LevelEvent
     from data_fetchers.financial_modelling_prep_data_fetcher import FmpDataFetcher
-    from services.price_monitor import PriceMonitor
     from services.price_state_manager import PriceStateManager
 
     _BREAKS = {LevelEvent.BREAK_ABOVE, LevelEvent.BREAK_BELOW}
@@ -939,7 +716,6 @@ async def _ml_start_monitor(
         cache=RedisCache(url=os.environ.get("REDIS_URL", "redis://localhost:6379")),
         fetcher_name="fmp",
     )
-    monitor = PriceMonitor(symbols=[symbol], bus=bus, poll_interval=20)
     manager = PriceStateManager(
         levels={symbol: levels},
         bus=bus,
@@ -949,13 +725,12 @@ async def _ml_start_monitor(
 
     async def _run():
         try:
-            await monitor.start()
+            await asyncio.Future()   # run until cancelled
         finally:
-            await monitor.stop()
             await manager.stop()
 
     task = asyncio.create_task(_run())
-    return task, monitor, manager
+    return task, None, manager
 
 
 async def cmd_ml(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -67,7 +67,7 @@ def test_parse_news_item_new_format():
     assert result.title == "Test Article"
     assert result.publisher == "Reuters"
     assert result.url == "https://finance.yahoo.com/test"
-    assert result.published_date == dt.datetime(2026, 6, 9, 5, 12, 33)
+    assert result.published_date == dt.datetime(2026, 6, 9, 5, 12, 33, tzinfo=dt.timezone.utc)
     assert result.image == "https://img.example.com/thumb.jpg"
     assert result.symbol == "AAPL"
 

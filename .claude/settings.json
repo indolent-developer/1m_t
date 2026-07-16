@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONPATH=src .venv/bin/python -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_news_service.py tests/services/test_news_monitor_service.py tests/services/test_news_reaction_analyzer.py -q)",
+      "Bash(.venv/bin/python -m pytest tests/data_fetchers/test_yahoo_finance_data_fetcher.py -q)",
+      "Bash(git stash *)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_news_service.py tests/services/test_news_monitor_service.py -q)",
+      "Bash(PYTHONPATH=src .venv/bin/python -m pytest tests/services/test_news_monitor_service.py tests/services/test_news_reaction_analyzer.py tests/adapters/events/test_local_event_bus.py tests/services/test_news_service.py -q)",
+      "Bash(PYTHONPATH=src .venv/bin/python -m pytest tests/services/test_news_monitor_service.py tests/services/test_news_reaction_analyzer.py tests/adapters/events/test_local_event_bus.py tests/services/test_news_service.py -q 2>&1 | grep -E \"^\\(FAILED|PASSED|ERROR\\)\" | sort > /tmp/after.txt *)",
+      "Read(//tmp/**)",
+      "Bash(PYTHONPATH=src .venv/bin/python -m pytest tests/services/test_news_monitor_service.py::test_process_emits_new_article tests/services/test_news_monitor_service.py::test_candidate_passes_mcap_and_vol -q)",
+      "Bash(PYTHONPATH=src .venv/bin/python -m pytest tests/services/test_news_reaction_analyzer.py tests/adapters/events/test_local_event_bus.py -q)",
+      "Bash(PYTHONPATH=src .venv/bin/python -m pytest tests/services/test_news_reaction_analyzer.py -q)",
+      "Bash(env)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('src/services/news_reaction_analyzer.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -m pytest tests/services/test_news_reaction_analyzer.py -q)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('src/services/key_level_monitor_service.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -m pytest tests/services/test_key_level_monitor_service.py -q)",
+      "Bash(cp src/services/key_level_monitor_service.py /tmp/klms.py.bak)",
+      "Bash(python3 -)",
+      "Bash(python3 -m pytest tests/ -q)",
+      "Bash(python3 -m pytest tests/services/test_news_service.py::test_sources_all_five -q)",
+      "Bash(python3 -m pytest tests/services/test_news_service.py tests/services/test_news_monitor_service.py tests/services/test_morning_enrichment.py -q)",
+      "Bash(python3 -m pytest tests/services/test_news_service.py::test_sources_all_five tests/services/test_news_service.py::test_init_no_benzinga_key_disables_benzinga -q)",
+      "Bash(python3 -m pytest tests/services/test_news_monitor_service.py::test_candidate_passes_mcap_and_vol tests/services/test_news_monitor_service.py::test_process_emits_new_article -q)",
+      "Bash(python3 -m pytest tests/services/test_news_monitor_service.py -q)",
+      "Bash(python3 -m pytest tests/services/test_news_service.py -q)",
+      "Bash(python3 -m pytest tests/services/test_morning_enrichment.py -q)",
+      "Bash(python3 -c \"import yfinance; print\\(yfinance.__version__\\)\")",
+      "Bash(grep -v \"^t$\")",
+      "Bash(echo \"exit:$?\")",
+      "Bash(python3 src/scripts/grade_tracker_day.py --date 2026-07-15 --stage 1)",
+      "Bash(python3 src/scripts/grade_tracker_day.py --date 2026-07-10 --stage 2)",
+      "Bash(python3 src/scripts/grade_tracker_day.py --help)",
+      "Bash(python3 src/scripts/grade_tracker_day.py --date 2026-06-30 --stage 1)",
+      "Bash(md5 -q 06.25.2026/claude.json 06.25.2026/claude2.json)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

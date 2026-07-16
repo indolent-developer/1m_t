@@ -149,6 +149,17 @@ class TelegramBot:
         app.add_handler(TGCommandHandler("sp",  cmd_sp))
         app.add_handler(TGCommandHandler("nk",  cmd_nk))
 
+        app.add_handler(MessageHandler(filters.COMMAND, self._unknown_command))
+
+    async def _unknown_command(
+        self,
+        update: Update,
+        _ctx: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        await update.message.reply_text(
+            "Unknown command. Use /help to see all commands.",
+        )
+
     def attach_broker(self, broker) -> None:
         """Wire a broker into the bot and subscribe the notifier to its events."""
         self._app.bot_data["broker"] = broker

@@ -6,11 +6,11 @@ Replicates TradingView "nk-post-market-movers" screener:
   - Price > $2
   - Market cap > $300M
   - Avg vol 30D > 500K
-  - Post-mkt change OUTSIDE -3% to +3%  (|chg| > 3%)
+  - Post-mkt change OUTSIDE -2% to +2%  (|chg| > 2%)
   - Post-mkt volume > 100K
 
 Output is always saved to:
-  <project_root>/data/daily_morning/post-market-movers/DD.MM.YYYY_post_movers.csv
+  <project_root>/data/daily_morning/post-market-movers/MM.DD.YYYY_post_movers.csv
 
 Install: pip install tradingview-screener pandas tabulate
 Run:     python run_post_market_scanner.py
@@ -35,7 +35,7 @@ _MOVERS_DIR = _ROOT / "data" / "daily_morning" / "post-market-movers"
 
 # ── Config ──────────────────────────────────────────────────────────────────
 DEFAULT_LIMIT       = 50
-DEFAULT_MIN_PMCHG   = 3.0
+DEFAULT_MIN_PMCHG   = 2.0
 DEFAULT_MIN_PRICE   = 2.0
 DEFAULT_MIN_MKTCAP  = 300_000_000
 DEFAULT_MIN_AVGVOL  = 500_000
@@ -48,6 +48,8 @@ _COLS = [
     "name", "description", "sector", "type", "exchange",
     # current session
     "open", "high", "low", "close", "change", "volume",
+    # pre-market
+    "premarket_change", "premarket_volume", "premarket_close",
     # post-market
     "postmarket_change", "postmarket_volume", "postmarket_close",
     # prior sessions (TradingView provides up to 2 bars back)
@@ -125,6 +127,9 @@ def run_scanner(
     gainers = df[df["postmarket_change"] > 0].copy()
     losers  = df[df["postmarket_change"] < 0].copy()
 
+    symbols_csv = ", ".join(df["name"].tolist())
+    print(f"  Symbols: {symbols_csv}\n")
+
     def print_section(subset, label):
         if subset.empty:
             return
@@ -160,7 +165,7 @@ def run_scanner(
 def save_results(df: pd.DataFrame, date: datetime | None = None) -> Path:
     """Save scanner results to the standard daily movers directory."""
     _MOVERS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = (date or datetime.now()).strftime("%d.%m.%Y")
+    ts = (date or datetime.now()).strftime("%m.%d.%Y")
     path = _MOVERS_DIR / f"{ts}_post_movers.csv"
     df.to_csv(path, index=False)
     print(f"  Saved → {path}\n")

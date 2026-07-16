@@ -30,18 +30,21 @@ Required env vars:
 
 Usage:
     ./run_scripts/run_live_monitor.sh
+    python run_live_monitor.py --list all
+    python run_live_monitor.py --list portfolio,watchlist
+    python run_live_monitor.py --list scanners
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
-import os
 import signal
 import sys
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=False)  # populate os.environ from .env; config_loader picks it up
 
 # ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,62 +56,111 @@ logging.getLogger("websockets").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-# ── imports (after sys.path / dotenv) ─────────────────────────────────────────
+# ── imports (after dotenv) ────────────────────────────────────────────────────
 from adapters.brokers.scalable_broker import ScalableBroker
-from adapters.events.local_event_bus import LocalEventBus
-from core.config.config_loader import ConfigLoader
+from core.config.config_loader import ConfigLoader, config_loader
 from data_fetchers.financial_modelling_prep_data_fetcher import FmpDataFetcher
-from infrastructure.cache.redis_cache import RedisCache
-from interfaces.telegram.alert_subscriber import TelegramAlertSubscriber
+from data_fetchers.finnhub_data_fetcher import FinnhubDataFetcher
+from data_fetchers.yahoo_finance_data_fetcher import YahooFinanceDataFetcher
 from scripts.scanners.post_mkt_loop import PostMarketScannerLoop
 from scripts.scanners.pre_mkt_loop import PreMarketScannerLoop
 from scripts.scanners.pre_mkt_scalp_loop import PreMarketScalpScannerLoop
 from scripts.scanners.vol_loop import VolumeScannerLoop
 from services.key_level_monitor_service import KeyLevelMonitorService
+from services.news_monitor_service import NewsMonitorService
+from services.news_reaction_analyzer import NewsReactionAnalyzer
 from services.price_history_service import PriceHistoryService
-from services.price_monitor import PriceMonitor
+from services.service_factory import ServiceFactory
 from services.symbol_auto_watcher import SymbolAutoWatcher
 
 logger = logging.getLogger("run_live_monitor")
 
 
-def _require(name: str) -> str:
-    val = os.environ.get(name, "").strip()
-    if not val:
-        logger.error("Missing required env var: %s", name)
+def _require_config(label: str, value: str) -> str:
+    """Exit early if a required config value is empty."""
+    if not value.strip():
+        logger.error("Missing required config: %s — check .env or base.yaml", label)
         sys.exit(1)
-    return val
+    return value.strip()
 
+
+
+def _parse_lists() -> set[str]:
+    parser = argparse.ArgumentParser(description="Live Market Monitor")
+    parser.add_argument(
+        "--list",
+        default="all",
+        help="Comma-separated symbol sources: portfolio, watchlist, scanners, all (default: all)",
+    )
+    args = parser.parse_args()
+    lists = {s.strip().lower() for s in args.list.split(",")}
+    if "all" in lists:
+        return {"portfolio", "watchlist", "scanners"}
+    valid = {"portfolio", "watchlist", "scanners"}
+    unknown = lists - valid
+    if unknown:
+        parser.error(f"Unknown list(s): {', '.join(unknown)}. Choose from: {', '.join(sorted(valid))}")
+    return lists
 
 
 async def main() -> None:
-    telegram_token   = _require("TELEGRAM_BOT_TOKEN")
-    telegram_chat_id = _require("TELEGRAM_CHAT_ID")
-    fmp_key          = _require("FMP_API_KEY")
-    redis_url        = os.environ.get("REDIS_URL", "redis://localhost:6379")
+    lists = _parse_lists()
+    logger.info("Active symbol sources: %s", ", ".join(sorted(lists)))
+
+    # ── Config ────────────────────────────────────────────────────────────────
+    factory      = ServiceFactory(config_loader)
+    tg_cfg       = config_loader.load_telegram()
+    fmp_cfg      = config_loader.load_data_apis().financialmodelingprep
+    finnhub_cfg  = config_loader.load_data_apis().finnhub
+
+    _require_config("telegram.bot_token (TELEGRAM_BOT_TOKEN)", tg_cfg.bot_token)
+    _require_config("telegram.chat_id (TELEGRAM_CHAT_ID)",     tg_cfg.chat_id)
+    _require_config("data_apis.financialmodelingprep.api_key (FMP_API_KEY)", fmp_cfg.api_key)
 
     # ── Infrastructure ────────────────────────────────────────────────────────
-    bus          = LocalEventBus()
-    fmp_fetcher  = FmpDataFetcher({"api_key": fmp_key})
-    redis_cache  = RedisCache(url=redis_url)
-    history_svc  = PriceHistoryService(fetcher=fmp_fetcher, cache=redis_cache, fetcher_name="fmp")
+    bus         = factory.event_bus()
+    redis_cache = factory.redis_cache()
+
+    try:
+        await redis_cache.ping()
+    except Exception as e:
+        logger.error("Redis unavailable (%s) — cannot start. Is Redis running?", e)
+        sys.exit(1)
+
+    fmp_fetcher = FmpDataFetcher({"api_key": fmp_cfg.api_key})
+    history_svc = PriceHistoryService(fetcher=fmp_fetcher, cache=redis_cache, fetcher_name="fmp")
 
     # ── Core services (start with no symbols; SymbolAutoWatcher populates them) ─
-    price_monitor = PriceMonitor(symbols=[], bus=bus, poll_interval=30, source="auto")
-    key_level_svc = KeyLevelMonitorService(
-        symbols=[],
-        bus=bus,
-        history_service=history_svc,
-    )
+    price_monitor = factory.price_monitor(symbols=[], bus=bus)
+    key_level_svc = KeyLevelMonitorService(symbols=[], bus=bus, history_service=history_svc)
+
+    # ── News sources (optional — enabled by API keys) ─────────────────────────
+    finnhub_fetcher = FinnhubDataFetcher({"api_key": finnhub_cfg.api_key}) if finnhub_cfg.api_key else None
+    try:
+        yahoo_fetcher = YahooFinanceDataFetcher()
+    except Exception as e:
+        logger.warning("Yahoo Finance fetcher unavailable: %s", e)
+        yahoo_fetcher = None
 
     # ── Subscribers ───────────────────────────────────────────────────────────
-    watcher  = SymbolAutoWatcher(bus, price_monitor, key_level_svc)
-    _telegram = TelegramAlertSubscriber(
+    watcher   = SymbolAutoWatcher(bus, price_monitor, key_level_svc)
+    _telegram = factory.telegram_alert_subscriber(bus=bus, exchange_source=watcher, cache=redis_cache)
+
+    news_monitor = NewsMonitorService(
         bus=bus,
-        token=telegram_token,
-        chat_id=telegram_chat_id,
-        exchange_source=watcher,
+        fmp=fmp_fetcher,
+        finnhub=finnhub_fetcher,
+        yahoo=yahoo_fetcher,
         cache=redis_cache,
+        poll_fmp_seconds=300,
+        watchlist=watcher._watched,
+    )
+    news_analyzer = NewsReactionAnalyzer(
+        bus=bus,
+        fmp=fmp_fetcher,
+        telegram_token=tg_cfg.bot_token,
+        chat_id=tg_cfg.chat_id,
+        watchlist=watcher._watched,
     )
 
     # ── Scanner loops ─────────────────────────────────────────────────────────
@@ -120,32 +172,38 @@ async def main() -> None:
     # ── Startup ───────────────────────────────────────────────────────────────
     logger.info("Starting KeyLevelMonitorService...")
     await key_level_svc.start()
+    logger.info("Starting NewsMonitorService...")
+    await news_monitor.start()
+    news_analyzer.start()
 
-    logger.info("Restoring today's watched symbols...")
-    await watcher.restore_today()
+    if "watchlist" in lists:
+        logger.info("Restoring today's watched symbols...")
+        await watcher.restore_today()
 
     # ── Portfolio sync ────────────────────────────────────────────────────────
-    # Sync open positions from each broker; falls back to last file state on failure
-    _brokers = {"scalable": ("scalable", ScalableBroker)}
-    for broker_id, (cfg_name, BrokerCls) in _brokers.items():
-        try:
-            cfg    = ConfigLoader().load_broker(cfg_name)
-            broker = BrokerCls(cfg)
-            await broker.connect()
-            await watcher.sync_portfolio(broker_id, broker)
-        except Exception as e:
-            logger.warning("Portfolio sync [%s] skipped: %s", broker_id, e)
+    if "portfolio" in lists:
+        _brokers = {"scalable": ("scalable", ScalableBroker)}
+        for broker_id, (cfg_name, BrokerCls) in _brokers.items():
+            try:
+                cfg    = config_loader.load_broker(cfg_name)
+                broker = BrokerCls(cfg)
+                await broker.connect()
+                await watcher.sync_portfolio(broker_id, broker)
+            except Exception as e:
+                logger.warning("Portfolio sync [%s] skipped: %s", broker_id, e)
 
     # ── Run everything ────────────────────────────────────────────────────────
     logger.info("All systems live. Ctrl-C to stop.")
 
-    tasks = [
-        asyncio.create_task(price_monitor.start(), name="price_monitor"),
-        asyncio.create_task(pre_mkt.run(),            name="pre_mkt_scanner"),
-        asyncio.create_task(pre_mkt_scalp.run(),     name="pre_mkt_scalp_scanner"),
-        asyncio.create_task(post_mkt.run(),          name="post_mkt_scanner"),
-        asyncio.create_task(volume.run(),           name="vol_scanner"),
-    ]
+    tasks = [asyncio.create_task(price_monitor.start(), name="price_monitor")]
+
+    if "scanners" in lists:
+        tasks += [
+            asyncio.create_task(pre_mkt.run(),       name="pre_mkt_scanner"),
+            asyncio.create_task(pre_mkt_scalp.run(), name="pre_mkt_scalp_scanner"),
+            asyncio.create_task(post_mkt.run(),      name="post_mkt_scanner"),
+            asyncio.create_task(volume.run(),        name="vol_scanner"),
+        ]
 
     # Graceful shutdown on SIGINT / SIGTERM
     loop = asyncio.get_event_loop()
@@ -161,15 +219,18 @@ async def main() -> None:
     await stop_event.wait()
 
     logger.info("Shutting down...")
-    pre_mkt.stop()
-    pre_mkt_scalp.stop()
-    post_mkt.stop()
-    volume.stop()
+    if "scanners" in lists:
+        pre_mkt.stop()
+        pre_mkt_scalp.stop()
+        post_mkt.stop()
+        volume.stop()
 
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
+    news_analyzer.stop()
+    await news_monitor.stop()
     await key_level_svc.stop()
     await price_monitor.stop()
     logger.info("Stopped.")

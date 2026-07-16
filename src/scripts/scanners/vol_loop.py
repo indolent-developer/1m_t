@@ -2,13 +2,11 @@
 scripts.scanners.vol_loop — VolumeScannerLoop
 
 Continuous daily high-volume scanner. Replicates the TradingView
-"nk-daily-high-volumes" screener. Runs a dynamic rel-vol threshold that ramps
-from 1.0x at open to 3.0x at close (matching run_daily_high_volumes.py
---smart mode).
+"nk-daily-high-volumes" screener. Uses a fixed rel-vol threshold of 3.0x.
 
 Criteria:
     Price > $2  |  MCap > $300M  |  AvgVol30D > 500K
-    RelVol10D > smart_threshold()
+    RelVol10D > 3.0x
 """
 from __future__ import annotations
 
@@ -36,20 +34,9 @@ _OPEN_H      = 9
 _OPEN_M      = 30
 _CLOSE_H     = 16
 _CLOSE_M     = 0
-_SESSION_MIN = 390   # 6.5 h × 60
-
 
 def _smart_threshold() -> float:
-    from datetime import datetime
-    now   = datetime.now(_ET)
-    open_ = now.replace(hour=_OPEN_H, minute=_OPEN_M, second=0, microsecond=0)
-    close = now.replace(hour=_CLOSE_H, minute=_CLOSE_M, second=0, microsecond=0)
-    if now <= open_:
-        return 1.5
-    if now >= close:
-        return 3.0
-    elapsed = (now - open_).total_seconds() / 60
-    return 1.5 + 1.5 * (elapsed / _SESSION_MIN)
+    return 3.0
 
 
 class VolumeScannerLoop(BaseScannerLoop):

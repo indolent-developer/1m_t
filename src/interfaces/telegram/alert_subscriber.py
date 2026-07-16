@@ -16,7 +16,7 @@ Exchange map is populated from scanner hits.  Level alerts for newly added
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import pytz
@@ -69,6 +69,30 @@ _LEVEL_LABEL = {
 
 _DEFAULT_CHART_ID = "3UGuuzJ4"
 
+_RESISTANCE_LABELS  = {"HOD", "Prev Day High", "1H Resistance", "1D Resistance", "Pivot R1", "Pivot R2", "Pivot R3"}
+_SUPPORT_LABELS     = {"LOD", "Prev Day Low",  "1H Support",    "1D Support",    "Pivot S1", "Pivot S2", "Pivot S3"}
+_DYNAMIC_LABELS     = {"HOD", "LOD"}
+_BOUNCE_WINDOW_SECS = 1800                      # 30 minutes
+
+
+def _semantic_label(evt) -> str | None:
+    """
+    Returns an overridden label for HOD/LOD reversal events, or None to use the default.
+    HOD/LOD: "Reversed" if level was touched recently (fresh high/low), "Bounce" if old.
+    Static resistance/support: always "Bounce".
+    """
+    is_res_break = evt.event == LevelEvent.BREAK_BELOW and evt.label in _RESISTANCE_LABELS
+    is_sup_break = evt.event == LevelEvent.BREAK_ABOVE and evt.label in _SUPPORT_LABELS
+    if not (is_res_break or is_sup_break):
+        return None
+    if evt.label not in _DYNAMIC_LABELS:
+        return "Bounce"
+    if evt.level_touched_at:
+        age = (datetime.now(timezone.utc) - evt.level_touched_at).total_seconds()
+        if age <= _BOUNCE_WINDOW_SECS:
+            return "Reversed"
+    return "Bounce"
+
 
 def _fmt_num(v: float) -> str:
     if v >= 1e12: return f"${v/1e12:.2f}T"
@@ -89,8 +113,7 @@ def _et_time() -> str:
 
 
 def _tv_url(symbol: str, exchange: str, chart_id: str) -> str:
-    exch = (exchange or "NASDAQ").upper()
-    return f"https://www.tradingview.com/chart/{chart_id}/?symbol={exch}%3A{symbol}"
+    return f"https://www.tradingview.com/chart/{chart_id}/?symbol={symbol}"
 
 
 def _fmt_scanner_hit(hit: ScannerHit, url: str) -> str:
@@ -103,27 +126,31 @@ def _fmt_scanner_hit(hit: ScannerHit, url: str) -> str:
     if hit.description:
         lines.append(f"_{hit.description}_")
 
+    dot       = "🟢" if (hit.change_pct or 0) >= 0 else "🔴"
     lines.append("")
-    chg_label = "Pre-Mkt" if hit.session == "pre" else "Day"
-    lines.append(f"💰 Price: *${hit.price:.2f}*  |  {chg_label}: `{direction}{abs(hit.change_pct):.2f}%`")
+    chg_label = "PreM" if hit.session == "pre" else "Day"
+    lines.append(f"💰 Price: *${hit.price:.2f}*  |  {chg_label}: {dot}`{direction}{abs(hit.change_pct):.2f}%`")
 
     if hit.session_change_pct is not None:
         sess_dir = "▲" if hit.session_change_pct >= 0 else "▼"
+        sess_dot = "🟢" if hit.session_change_pct >= 0 else "🔴"
         if hit.session == "pre":
-            label = "Pre-Mkt"
+            label = "PreM"
         elif hit.session == "post":
-            label = "Post-Mkt"
+            label = "PostM"
         else:
             label = "From Open"
-        lines.append(f"📊 {label}: `{sess_dir}{abs(hit.session_change_pct):.2f}%`")
+        lines.append(f"📊 {label}: {sess_dot}`{sess_dir}{abs(hit.session_change_pct):.2f}%`")
 
     vol_parts = []
     if hit.rel_vol is not None:
-        vol_parts.append(f"Rel Vol: *{hit.rel_vol:.1f}x*")
+        rv_str = "<0.01x" if hit.rel_vol < 0.01 else f"{hit.rel_vol:.2f}x"
+        vol_parts.append(f"Rel Vol: *{rv_str}*")
     if hit.volume is not None:
-        vol_parts.append(f"Vol: {_fmt_vol(hit.volume)}")
+        vol_label = "PreM Vol" if hit.session == "pre" else ("PostM Vol" if hit.session == "post" else "Vol")
+        vol_parts.append(f"{vol_label}: {_fmt_vol(hit.volume)}")
     if hit.avg_vol_30d is not None:
-        vol_parts.append(f"Avg: {_fmt_vol(hit.avg_vol_30d)}")
+        vol_parts.append(f"AvgDay: {_fmt_vol(hit.avg_vol_30d)}")
     if vol_parts:
         lines.append("📈 " + "  |  ".join(vol_parts))
 
@@ -137,14 +164,15 @@ def _fmt_scanner_hit(hit: ScannerHit, url: str) -> str:
 
     lines.append(f"⏰ {_et_time()}")
     lines.append("")
-    lines.append(f"[View on TradingView]({url})")
+    lines.append(url)
 
     return "\n".join(lines)
 
 
 def _fmt_level_event(evt: PriceLevelEvent, url: str) -> str:
-    emoji     = _LEVEL_EMOJI.get(evt.event, "📍")
-    lbl       = _LEVEL_LABEL.get(evt.event, evt.event.value)
+    override = _semantic_label(evt)
+    emoji    = "↩️" if override else _LEVEL_EMOJI.get(evt.event, "📍")
+    lbl      = override if override else _LEVEL_LABEL.get(evt.event, evt.event.value)
     convincing = "convincing" if evt.convincing else "marginal"
 
     header_label = f" [{evt.label}]" if evt.label else ""
@@ -164,7 +192,7 @@ def _fmt_level_event(evt: PriceLevelEvent, url: str) -> str:
 
     lines.append(f"⏰ {_et_time()}")
     lines.append("")
-    lines.append(f"[View on TradingView]({url})")
+    lines.append(url)
 
     return "\n".join(lines)
 

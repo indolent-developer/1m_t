@@ -294,9 +294,13 @@ an action with levels.
 INPUTS
 - MY PRE-MARKET CALL (Run 2 output — pasted below): conviction, score, prior
   close, pre-market high/low, signal levels per name.
-- Use web access to retrieve NOW per ticker: current price, the opening-range HIGH
-  and LOW (high/low of 9:30–10:00 ET), VWAP, current volume vs typical, and whether
-  the gap has filled (traded back to prior close).
+- TODAY'S SESSION DATA is pre-computed and embedded in MARKET DATA below for each
+  ticker: 5-min OHLC bars with cumulative VWAP, opening-range high/low (9:30–10:00
+  ET), current price (last bar close), gap status vs prior close, and 30-min volume.
+  Read these values directly — do NOT fetch price, VWAP, OR levels, or gap status
+  from the web; they are already calculated.
+- Use web access ONLY for: macro snapshot (ES/NQ futures, VIX, sector ETFs) and
+  any fresh catalyst or breaking news that appeared after Run 2.
 
 FRAMEWORK (per ticker)
 1. Gap status: holding the gap, partially filled, or fully filled to prior close?
@@ -390,13 +394,14 @@ FIELD RULES
   "trim" (reduce position — losing conviction), "avoid" (do not enter),
   "none" (skip / already closed)
 - run.is_actionable: always true at stage 3
-- levels.current_price: live price from web access right now; null if unavailable
-- levels.opening_range_high/low: high/low of the 9:30–10:00 ET half-hour
-- levels.gap_status: "holding" (current_price > prior_close),
-  "partial_fill" (moved back but still above prior_close),
-  "full_fill" (traded back to or below prior_close)
-- levels.above_vwap: derive from current_price vs vwap
-- pct_vs_prior_close: number (e.g. 3.1 means +3.1%); null if price unavailable
+- levels.current_price: last 5-min bar close from embedded session data
+- levels.opening_range_high/low: from embedded session data (9:30–10:00 ET window)
+- levels.vwap: cumulative session VWAP at last bar, from embedded session data
+- levels.above_vwap: derive from embedded current_price vs vwap
+- levels.gap_status: from embedded session data — "holding" (price at or above PM
+  close), "partial_fill" (above prior close but below PM close), "full_fill" (at or
+  below prior close)
+- pct_vs_prior_close: compute from embedded current_price and prior_close
 - changed_vs_run2: null if no change; one sentence if verdict/action differs from Run 2 conviction
 - confirm_at_premarket: null (stage 1 field — do not populate)
 
@@ -451,13 +456,18 @@ def _arrow(v) -> str:
     return "▲" if v >= 0 else "▼"
 
 
-def format_ticker_block(row: "pd.Series", ohlc_5d: list[dict] | None = None) -> str:
+def format_ticker_block(
+    row: "pd.Series",
+    ohlc_5d: list[dict] | None = None,
+    intraday: dict | None = None,
+    news: list[dict] | None = None,
+) -> str:
     """
     Format one scanner row into a readable text block for prompt injection.
 
-    ohlc_5d: list of 5 dicts (oldest first), each with keys:
-        date, open, high, low, close, volume
-    Days 0-2 come from TradingView ([2],[1],current); days 3-4 from yfinance.
+    ohlc_5d:  list of dicts (oldest first) with keys: date, open, high, low, close, volume
+    intraday: dict with keys: bars (list of 5-min bar dicts with time/OHLC/volume/vwap),
+              vwap, or_high, or_low, current_price, above_vwap, gap_status, vol_30m
     """
     symbol = row.get("name", "?")
     desc   = row.get("description", "")
@@ -521,6 +531,57 @@ def format_ticker_block(row: "pd.Series", ohlc_5d: list[dict] | None = None) -> 
                 f" {_fvol(bar.get('volume')):>9}"
                 f"{marker}"
             )
+
+    if intraday and intraday.get("bars"):
+        bars     = intraday["bars"]
+        or_high  = intraday.get("or_high")
+        or_low   = intraday.get("or_low")
+        vwap     = intraday.get("vwap")
+        cur      = intraday.get("current_price")
+        above    = intraday.get("above_vwap")
+        gap_st   = intraday.get("gap_status")
+        vol_30m  = intraday.get("vol_30m")
+
+        lines.append("")
+        lines.append("TODAY'S 5-MIN SESSION (ET):")
+        lines.append(
+            f"  {'Time':<7} {'Open':>7} {'High':>7} {'Low':>7} {'Close':>7} {'Volume':>9}  {'VWAP':>8}"
+        )
+        for i, bar in enumerate(bars):
+            marker = "  ← last" if i == len(bars) - 1 else ""
+            lines.append(
+                f"  {bar.get('time', ''):<7}"
+                f" {_fv(bar.get('open')):>7}"
+                f" {_fv(bar.get('high')):>7}"
+                f" {_fv(bar.get('low')):>7}"
+                f" {_fv(bar.get('close')):>7}"
+                f" {_fvol(bar.get('volume')):>9}"
+                f"  {_fv(bar.get('vwap')):>8}"
+                f"{marker}"
+            )
+
+        lines.append("")
+        lines.append(
+            f"OPENING RANGE (9:30–10:00):  OR-High: {_fv(or_high)}  |  OR-Low: {_fv(or_low)}"
+        )
+        above_str = "YES" if above is True else ("NO" if above is False else "—")
+        lines.append(
+            f"VWAP: ${_fv(vwap)}  |  Current: ${_fv(cur)}  |  Above VWAP: {above_str}"
+        )
+        gap_label   = (gap_st or "—").upper().replace("_", " ")
+        prior_close = row.get("close")
+        lines.append(f"Gap Status: {gap_label}  (prior close: ${_fv(prior_close)})")
+        lines.append(f"30-min Volume: {_fvol(vol_30m)}")
+
+    if news:
+        lines.append("")
+        lines.append("NEWS (last 2d):")
+        for item in news[:5]:
+            ts  = item.get("ts", "")
+            src = item.get("source", "")
+            hdr = f"  [{ts}] {src}" if src else f"  [{ts}]"
+            lines.append(hdr)
+            lines.append(f"    {item.get('title', '')[:110]}")
 
     return "\n".join(lines)
 

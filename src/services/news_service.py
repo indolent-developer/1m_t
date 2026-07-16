@@ -1,14 +1,15 @@
 """
 services.news_service
 
-Aggregates stock news from FMP, Finnhub, Alpha Vantage, and Yahoo Finance
-for a given ticker within a rolling lookback window.
+Aggregates stock news from FMP, Finnhub, Alpha Vantage, Yahoo Finance, and
+Benzinga for a given ticker within a rolling lookback window.
 
 Sources:
     FMP            — FmpDataFetcher.get_stock_news()
     Finnhub        — FinnhubDataFetcher.get_stock_news()
     Alpha Vantage  — AlphaVantageDataFetcher.get_stock_news()
     Yahoo Finance  — YahooFinanceDataFetcher.get_stock_news()  [always on]
+    Benzinga       — BenzingaDataFetcher.get_stock_news()
 
 Each source is tried independently; a failure in one does not affect the
 others. Results are merged, deduplicated by normalised title, filtered to
@@ -20,14 +21,16 @@ Usage:
     news = svc.get_news("NVDA", lookback_days=1)  # today only
     bulk = svc.get_news_multi(["AAPL", "TSLA"])   # {symbol: [StockNews]}
     print(svc.last_fetch_stats)
-    # {'FMP': 12, 'Finnhub': 8, 'AlphaVantage': 6, 'Yahoo': 10,
-    #  'merged': 25, 'dropped_dups': 11}
+    # {'FMP': 12, 'Finnhub': 8, 'AlphaVantage': 6, 'Yahoo': 10, 'Benzinga': 5,
+    #  'merged': 30, 'dropped_dups': 11}
 
 Environment:
     FMP_API_KEY              — enables FMP source
     FINNHUB_API_KEY          — enables Finnhub source
     AV_API_KEY  or
     ALPHA_VANTAGE_API_KEY    — enables Alpha Vantage source
+    BENZINGA_API_KEY  or
+    BENZIGA_API_KEY (typo, accepted too) — enables Benzinga source
     Yahoo Finance is always on (no API key required).
 """
 from __future__ import annotations
@@ -60,7 +63,7 @@ class NewsService:
     disabled — the rest continue working.
 
     After each get_news() call, last_fetch_stats holds a breakdown:
-        {'FMP': N, 'Finnhub': N, 'AlphaVantage': N, 'Yahoo': N,
+        {'FMP': N, 'Finnhub': N, 'AlphaVantage': N, 'Yahoo': N, 'Benzinga': N,
          'merged': N, 'dropped_dups': N}
     """
 
@@ -68,10 +71,11 @@ class NewsService:
         self.lookback_days    = lookback_days
         self.last_fetch_stats: Dict[str, int] = {}
 
-        self._fmp     = self._build_fmp()
-        self._finnhub = self._build_finnhub()
-        self._av      = self._build_av()
-        self._yf      = self._build_yf()
+        self._fmp      = self._build_fmp()
+        self._finnhub  = self._build_finnhub()
+        self._av       = self._build_av()
+        self._yf       = self._build_yf()
+        self._benzinga = self._build_benzinga()
 
         logger.info("NewsService: active sources — %s", ", ".join(self.sources))
 
@@ -118,6 +122,17 @@ class NewsService:
             logger.warning("Yahoo Finance source init failed: %s", e)
             return None
 
+    def _build_benzinga(self):
+        key = os.environ.get("BENZINGA_API_KEY") or os.environ.get("BENZIGA_API_KEY")
+        if not key:
+            return None
+        try:
+            from data_fetchers.benzinga_data_fetcher import BenzingaDataFetcher
+            return BenzingaDataFetcher({"api_key": key})
+        except Exception as e:
+            logger.warning("Benzinga source init failed: %s", e)
+            return None
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     @property
@@ -132,6 +147,8 @@ class NewsService:
             active.append("AlphaVantage")
         if self._yf:
             active.append("Yahoo")
+        if self._benzinga:
+            active.append("Benzinga")
         return active
 
     def get_news(
@@ -154,12 +171,13 @@ class NewsService:
         self.last_fetch_stats = {**raw_counts, "merged": len(result), "dropped_dups": dropped}
 
         logger.info(
-            "[NewsService] %s: FMP=%d Finnhub=%d AV=%d Yahoo=%d → merged=%d (-%d dups)",
+            "[NewsService] %s: FMP=%d Finnhub=%d AV=%d Yahoo=%d Benzinga=%d → merged=%d (-%d dups)",
             symbol,
             raw_counts.get("FMP", 0),
             raw_counts.get("Finnhub", 0),
             raw_counts.get("AlphaVantage", 0),
             raw_counts.get("Yahoo", 0),
+            raw_counts.get("Benzinga", 0),
             len(result),
             dropped,
         )
@@ -224,11 +242,29 @@ class NewsService:
                 logger.warning("[Yahoo] fetch failed for %s: %s", symbol, e)
                 counts["Yahoo"] = 0
 
+        if self._benzinga:
+            try:
+                fetched = self._benzinga.get_stock_news(symbol=symbol, limit=50)
+                _stamp(fetched, "Benzinga")
+                counts["Benzinga"] = len(fetched)
+                items.extend(fetched)
+                logger.info("[Benzinga]     %3d articles for %s", len(fetched), symbol)
+            except Exception as e:
+                logger.warning("[Benzinga] fetch failed for %s: %s", symbol, e)
+                counts["Benzinga"] = 0
+
         return counts, items
 
     def _process(self, items: List[StockNews], since: dt.datetime) -> List[StockNews]:
-        # Filter to lookback window
-        recent = [n for n in items if n.published_date >= since]
+        # Filter to lookback window.
+        # Fetchers produce mixed datetime types (FMP=pytz-aware ET, Finnhub=naive local,
+        # Yahoo=naive UTC); strip tzinfo to naive UTC so comparison never raises TypeError.
+        def _to_naive_utc(d: dt.datetime) -> dt.datetime:
+            if d.tzinfo is not None:
+                return d.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            return d
+
+        recent = [n for n in items if _to_naive_utc(n.published_date) >= since]
 
         # Deduplicate by normalised title — first occurrence wins (FMP → Finnhub → AV priority)
         seen:   set[str]        = set()
@@ -240,7 +276,7 @@ class NewsService:
                 unique.append(n)
 
         # Newest-first
-        unique.sort(key=lambda n: n.published_date, reverse=True)
+        unique.sort(key=lambda n: _to_naive_utc(n.published_date), reverse=True)
         return unique
 
 

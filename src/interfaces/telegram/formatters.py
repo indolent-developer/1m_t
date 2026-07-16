@@ -235,76 +235,60 @@ def v2_quote(quote: "Quote") -> str:
     )
 
 
-def v2_indicators(symbol: str, tf: str, ts: str, data: dict) -> str:
-    atr_val   = data.get("atr")
-    atr_pct   = data.get("atr_pct")
-    rsi_val   = data.get("rsi")
-    st_val    = data.get("st_value")
-    st_dir    = data.get("st_dir")
-    st_flip   = data.get("st_flipped", False)
-    ema8_val  = data.get("ema8")
-    ema20_val = data.get("ema20")
-
-    st_emoji    = "🟢" if st_dir == 1 else "🔴"
-    st_label    = "Long" if st_dir == 1 else "Short"
-    st_flip_tag = " \\[FLIP\\]" if st_flip else ""
-    rsi_emoji   = "🔥" if rsi_val and rsi_val >= 70 else ("🧊" if rsi_val and rsi_val <= 30 else "")
+def v2_indicators(r: "IndicatorResult", tf_label: str | None = None) -> str:
+    """Format an IndicatorResult as a MarkdownV2 message."""
+    st_emoji    = "🟢" if r.st_dir == 1 else "🔴"
+    st_label    = "Long" if r.st_dir == 1 else "Short"
+    st_flip_tag = " \\[FLIP\\]" if r.st_flipped else ""
+    rsi_emoji   = "🔥" if r.rsi and r.rsi >= 70 else ("🧊" if r.rsi and r.rsi <= 30 else "")
 
     def _n(v, fmt=".2f"): return _esc(f"{v:{fmt}}") if v is not None else "—"
 
-    adx_val = data.get("adx")
+    tf_display = _esc(tf_label or r.tf)
 
     return (
-        f"*📊 Indicators — {_esc(symbol)}* `{_esc(tf)}`\n"
-        f"`{_esc(ts)}`\n"
+        f"*📊 Indicators — {_esc(r.symbol)}* `{tf_display}`\n"
+        f"`{_esc(r.ts)}`\n"
         f"{'─' * 30}\n"
-        f"ATR        `{_n(atr_val)}` \\({_n(atr_pct, '.2f')}%\\)\n"
-        f"RSI        `{_n(rsi_val)}` {rsi_emoji}\n"
-        f"ADX 20     `{_n(adx_val, '.1f')}`\n"
-        f"EMA 8      `{_n(ema8_val)}`\n"
-        f"EMA 20     `{_n(ema20_val)}`\n"
-        f"SuperTrend {st_emoji} `{_n(st_val)}` _{_esc(st_label)}_{st_flip_tag}"
+        f"ATR        `{_n(r.atr)}` \\({_n(r.atr_pct, '.2f')}%\\)\n"
+        f"RSI        `{_n(r.rsi)}` {rsi_emoji}\n"
+        f"ADX 20     `{_n(r.adx, '.1f')}`\n"
+        f"EMA 8      `{_n(r.ema8)}`\n"
+        f"EMA 20     `{_n(r.ema20)}`\n"
+        f"SuperTrend {st_emoji} `{_n(r.st_value)}` _{_esc(st_label)}_{st_flip_tag}"
     )
 
 
-def v2_portfolio_indicators(tf: str, results: list, skipped: list) -> str:
+def v2_portfolio_indicators(pr: "PortfolioIndicatorResult", tf: str) -> str:
     """Compact one-line-per-symbol portfolio indicator table."""
-    now    = dt.datetime.utcnow().strftime("%H:%M UTC")
-    results = sorted(results, key=lambda r: r[2].get("atr_pct") or 0, reverse=True)
-    lines  = [f"*📊 Portfolio — {_esc(tf)} \\+ext* `{_esc(now)}`\n"]
+    now   = dt.datetime.utcnow().strftime("%H:%M UTC")
+    rows  = sorted(pr.rows, key=lambda r: r.indicators.atr_pct or 0, reverse=True)
+    lines = [f"*📊 Portfolio — {_esc(tf)} \\+ext* `{_esc(now)}`\n"]
 
-    for ticker, _pos_name, data, _ts in results:
-        st_dir   = data.get("st_dir")
-        st_emoji = "🟢" if st_dir == 1 else "🔴"
-        st_val   = data.get("st_value")
-        rsi_val  = data.get("rsi")
-        atr_pct  = data.get("atr_pct")
-        flip_tag = " \\[F\\]" if data.get("st_flipped") else ""
+    def _v(v, fmt=".2f"):
+        return _esc(f"{v:{fmt}}") if v is not None else "\\-"
 
-        def _v(v, fmt=".2f"):
-            return _esc(f"{v:{fmt}}") if v is not None else "\\-"
-
-        adx_val   = data.get("adx")
-        ema8_val  = data.get("ema8")
-        ema20_val = data.get("ema20")
-        if ema8_val is not None and ema20_val is not None:
-            ema_tag = " `\\(T\\)`" if ema8_val > ema20_val else " `\\(↓\\)`"
-        else:
-            ema_tag = ""
+    for row in rows:
+        ind      = row.indicators
+        st_emoji = "🟢" if ind.st_dir == 1 else "🔴"
+        flip_tag = " \\[F\\]" if ind.st_flipped else ""
+        ema_tag  = ""
+        if ind.ema8 is not None and ind.ema20 is not None:
+            ema_tag = " `\\(T\\)`" if ind.ema8 > ind.ema20 else " `\\(↓\\)`"
 
         lines.append(
-            f"*{_esc(ticker)}* {st_emoji} `{_v(st_val)}`{flip_tag}"
-            f"  RSI `{_v(rsi_val, '.0f')}`"
-            f"  ADX `{_v(adx_val, '.0f')}`"
-            f"  ATR `{_v(atr_pct)}`%"
+            f"*{_esc(row.ticker)}* {st_emoji} `{_v(ind.st_value)}`{flip_tag}"
+            f"  RSI `{_v(ind.rsi, '.0f')}`"
+            f"  ADX `{_v(ind.adx, '.0f')}`"
+            f"  ATR `{_v(ind.atr_pct)}`%"
             f"{ema_tag}"
         )
 
-    if skipped:
-        names = _esc(", ".join(n for n, _ in skipped[:8]))
-        suffix = _esc(f" +{len(skipped) - 8} more") if len(skipped) > 8 else ""
+    if pr.skipped:
+        names  = _esc(", ".join(n for n, _ in pr.skipped[:8]))
+        suffix = _esc(f" +{len(pr.skipped) - 8} more") if len(pr.skipped) > 8 else ""
         lines.append(
-            f"\n⚠️ _Skipped \\({_esc(str(len(skipped)))}\\): {names}{suffix}_"
+            f"\n⚠️ _Skipped \\({_esc(str(len(pr.skipped)))}\\): {names}{suffix}_"
         )
 
     return "\n".join(lines)

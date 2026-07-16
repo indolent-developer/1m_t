@@ -18,6 +18,8 @@ import asyncio
 import datetime as dt
 from typing import Dict, List, Optional
 
+_LOAD_COOLDOWN_SECS = 30
+
 import pandas as pd
 import pandas_ta as ta
 
@@ -42,24 +44,30 @@ class IndicatorProvider:
         refresh_interval_seconds: int = 300,
     ) -> None:
         self._history  = history
-        self._symbols  = symbols
+        self._symbols  = list(symbols)
         self._tf       = timeframe
         self._period   = default_period
         self._refresh  = refresh_interval_seconds
         self._data: Dict[str, pd.DataFrame] = {}
         self._loading: set[str] = set()
+        self._last_loaded: Dict[str, dt.datetime] = {}
 
     # ── Public ────────────────────────────────────────────────────────────────
 
     async def load(self) -> None:
         await asyncio.gather(*[self.load_one(s) for s in list(self._symbols)])
 
-    async def load_one(self, symbol: str) -> None:
+    async def load_one(self, symbol: str, force: bool = False) -> None:
         if symbol in self._loading:
             return
+        if not force:
+            last = self._last_loaded.get(symbol)
+            if last and (dt.datetime.now() - last).total_seconds() < _LOAD_COOLDOWN_SECS:
+                return
         self._loading.add(symbol)
         try:
             await self._load_one(symbol)
+            self._last_loaded[symbol] = dt.datetime.now()
         finally:
             self._loading.discard(symbol)
 
@@ -86,6 +94,21 @@ class IndicatorProvider:
         if hasattr(series, "__len__") and len(series) == 0:
             return None
         return float(series.iloc[-1]) if hasattr(series, "iloc") else float(series)
+
+    def supertrend_direction(self, symbol: str, length: int = 7, multiplier: float = 3.0) -> Optional[int]:
+        """Return latest supertrend direction: +1 (bullish) or -1 (bearish), or None if unavailable."""
+        df = self._data.get(symbol)
+        if df is None or df.empty:
+            return None
+        try:
+            from services.indicators_service import supertrend as _supertrend
+            df_st = df.rename(columns={"high": "h", "low": "l", "close": "c"})
+            result = _supertrend(df_st, length=length, multiplier=multiplier)
+            d = result["direction"].dropna()
+            return int(d.iloc[-1]) if len(d) > 0 else None
+        except Exception as e:
+            logger.warning("IndicatorProvider: supertrend_direction(%s) error: %s", symbol, e)
+            return None
 
     async def refresh_loop(self) -> None:
         while True:

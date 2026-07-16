@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from core.entities.news_event import NewsEvent
+
 
 class EarningsTime(Enum):
     """When an earnings report is released relative to the session."""
@@ -57,6 +59,13 @@ class StockNews:
     text:           str
     image:          str = ""
     site:           str = ""
+    fetched_at:     Optional[dt.datetime] = None   # when our system received this article
+    news_source:    str = ""                        # "FMP" | "Finnhub" | "Yahoo" | "IBKR"
+
+    # Event-bus routing key — LocalEventBus.emit() dispatches on payload.event.
+    # Must stay NEWS_PUBLISHED so NewsReactionAnalyzer and any other subscriber
+    # actually receive this item when NewsMonitorService calls bus.emit(item).
+    event: NewsEvent = NewsEvent.NEWS_PUBLISHED
 
     # Derived unique key — set by __post_init__
     key: str = field(init=False, default="")
@@ -64,13 +73,25 @@ class StockNews:
     def __post_init__(self) -> None:
         self.key = f"{self.symbol}_{self.title}_{self.published_date.strftime('%Y%m%d%H%M%S')}"
 
+    @property
+    def latency_seconds(self) -> Optional[float]:
+        if self.fetched_at and self.published_date:
+            pub = self.published_date
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=dt.timezone.utc)
+            return (self.fetched_at - pub).total_seconds()
+        return None
+
     @classmethod
     def from_dict(cls, data: dict) -> "StockNews":
+        import pytz as _pytz
+        _ET = _pytz.timezone("America/New_York")
         date_raw = data.get("publishedDate", data.get("published_date", ""))
-        published = (
-            dt.datetime.strptime(date_raw, "%Y-%m-%d %H:%M:%S")
-            if isinstance(date_raw, str) else date_raw
-        )
+        if isinstance(date_raw, str):
+            naive = dt.datetime.strptime(date_raw, "%Y-%m-%d %H:%M:%S")
+            published = _ET.localize(naive)   # FMP publishedDate is US Eastern
+        else:
+            published = date_raw
         return cls(
             symbol=data.get("symbol", ""),
             published_date=published,

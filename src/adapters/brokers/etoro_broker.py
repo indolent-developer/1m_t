@@ -323,7 +323,30 @@ class eToroBroker(BaseBroker):
                 logger.warning("[%s] _map_position failed for %s: %s", self.broker_id, r, e)
         if symbol:
             positions = [p for p in positions if p.symbol == symbol.upper()]
+
+        # Enrich with live prices — the portfolio endpoint has no current price
+        await self._enrich_positions_with_live_prices(positions)
         return positions
+
+    async def _enrich_positions_with_live_prices(self, positions: List[Position]) -> None:
+        unique_symbols = list({p.symbol for p in positions if p.symbol})
+        if not unique_symbols:
+            return
+        quotes = await self.get_quotes(unique_symbols)
+        for p in positions:
+            q = quotes.get(p.symbol)
+            if not q:
+                continue
+            mid = float((q.bid + q.ask) / 2) if q.bid and q.ask else float(q.ask or q.bid or 0)
+            if not mid:
+                continue
+            sign           = 1 if p.side == TradeSide.LONG else -1
+            pnl            = sign * (mid - p.average_price) * p.quantity
+            collateral     = float((p.additional_info or {}).get("amount") or (p.average_price * p.quantity / max(p.leverage, 1)))
+            pnl_pct        = (pnl / collateral * 100) if collateral else 0.0
+            p.market_value              = mid * p.quantity
+            p.unrealized_pnl            = pnl
+            p.unrealized_pnl_percentage = pnl_pct
 
     async def _load_instrument_map(self) -> None:
         """Bulk-load instrumentID → ticker from /api/v1/market-data/instruments (symbolFull field)."""

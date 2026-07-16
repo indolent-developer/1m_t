@@ -51,6 +51,17 @@ def print_triggered_preview(
         trigger_line = f"  Trigger:     ${trigger_usd:.4f}  →  €{trigger_eur:.4f}  (rate {rate:.4f})"
     else:
         trigger_line = f"  Trigger:     €{trigger_eur:.4f}"
+
+    current_price_raw = preview.get(price_key)
+    try:
+        cp = float(current_price_raw)
+        diff = trigger_eur - cp
+        diff_pct = diff / cp * 100
+        arrow = "↑" if diff >= 0 else "↓"
+        dist_tag = f"  {arrow} {diff:+.2f} {cur} ({diff_pct:+.1f}%)"
+    except (TypeError, ValueError, ZeroDivisionError):
+        dist_tag = ""
+
     print(
         f"\n  {'─'*44}\n"
         f"  {f'{type_label}-{side_up} ORDER PREVIEW':^44}\n"
@@ -59,7 +70,7 @@ def print_triggered_preview(
         f"  Instrument:  {inst_name or '—'}\n"
         f"  ISIN:        {preview.get('isin', '—')}\n"
         f"{trigger_line}\n"
-        f"  Current {price_key}:  {preview.get(price_key, '—')} {cur}\n"
+        f"  Current {price_key}:  {current_price_raw} {cur}{dist_tag}\n"
         f"  Venue:       {preview.get('venue', '—')}\n"
         f"  Fee:         {fee_val} {cur}\n"
         f"  {'─'*44}"

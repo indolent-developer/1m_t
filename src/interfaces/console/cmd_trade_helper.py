@@ -18,15 +18,13 @@ _RESET  = "\033[0m"
 _CONFIG_YAML = Path(__file__).resolve().parents[3] / "config.yaml"
 
 
-async def cmd_trade_helper(broker, args: list) -> None:
-    if not args:
-        print("Usage: /th SYMBOL")
-        print("  Deep pre-trade analysis — technicals + market context + news + LLM verdict.")
-        print("  Requires FMP_API_KEY (prices/profile). XAI_API_KEY for LLM synthesis.")
-        return
+async def _analyse_symbol(broker, symbol: str, print_prompt: bool = False):
+    """Run the full /th pipeline for one symbol.
 
-    symbol = args[0].upper()
-
+    Returns (report, spread_info, own_position) on success, or None if the
+    symbol doesn't resolve to a live quote / the user aborts a no-broker run.
+    Raises on downstream analysis failures — callers decide how to report them.
+    """
     # Quick symbol existence check before doing any heavy work
     try:
         import os
@@ -36,24 +34,29 @@ async def cmd_trade_helper(broker, args: list) -> None:
         ).get_quotes()
         if not _quotes.get(symbol) or not _quotes[symbol].price:
             print(f"❌ Unknown symbol: {symbol}")
-            return
+            return None
     except Exception:
         pass  # network hiccup — let the main analysis fail with its own error
 
     # ── Spread check ──────────────────────────────────────────────────────────
     spread_pct: float | None = None
     spread_info: str = ""
+    live_bid: float | None = None
+    live_ask: float | None = None
     if broker is not None:
         try:
             q = await broker.get_quote(symbol)
             if q and q.ask and q.bid and float(q.ask) > 0:
+                live_bid   = float(q.bid)
+                live_ask   = float(q.ask)
                 spread_pct = float(q.spread / q.ask * 100)
-                spread_info = f"bid ${float(q.bid):.4f} / ask ${float(q.ask):.4f} / spread {spread_pct:.2f}%"
+                spread_info = f"bid ${live_bid:.4f} / ask ${live_ask:.4f} / spread {spread_pct:.2f}%"
                 if spread_pct > 1.5:
-                    print(f"\n⚠️  {symbol}  spread {spread_pct:.2f}% exceeds 1.5% threshold — DO NOT ENTER")
+                    print(f"\n{'!'*60}")
+                    print(f"⚠️  WARNING: {symbol}  spread {spread_pct:.2f}% exceeds 1.5% threshold — DO NOT ENTER")
                     print(f"   {spread_info}")
-                    print("   Run /q or check liquidity before trading this stock.\n")
-                    return
+                    print(f"   Run /q or check liquidity before trading this stock.")
+                    print(f"{'!'*60}\n")
         except Exception as e:
             print(f"  ⚠ Spread check failed ({e}) — continuing without it")
     else:
@@ -61,45 +64,97 @@ async def cmd_trade_helper(broker, args: list) -> None:
         answer = input("   Continue without spread check? [y/N] ").strip().lower()
         if answer != "y":
             print("Aborted.")
-            return
+            return None
 
     print(f"⏳ Analysing {symbol} — fetching prices, market data, news…")
 
-    try:
-        from services.trade_helper_service import TradeHelperService
-        if _CONFIG_YAML.exists():
-            svc = TradeHelperService.from_config_yaml(str(_CONFIG_YAML))
-        else:
-            svc = TradeHelperService()
+    from services.trade_helper_service import TradeHelperService
+    from data_fetchers.financial_modelling_prep_data_fetcher import FmpDataFetcher
+    from infrastructure.cache.redis_cache import RedisCache
+    from services.price_history_service import PriceHistoryService
+    import os as _os
 
-        # Fetch open positions from the active broker (same as /p)
-        positions = []
-        if broker is not None:
+    _fmp_key = _os.environ.get("FMP_API_KEY", "")
+    _redis_url = _os.environ.get("REDIS_URL", "redis://localhost:6379")
+    _price_history_svc = PriceHistoryService(
+        fetcher=FmpDataFetcher({"api_key": _fmp_key}),
+        cache=RedisCache(url=_redis_url),
+        fetcher_name="fmp",
+    ) if _fmp_key else None
+
+    if _CONFIG_YAML.exists():
+        svc = TradeHelperService.from_config_yaml(str(_CONFIG_YAML),
+                                                  price_history_svc=_price_history_svc)
+    else:
+        svc = TradeHelperService(price_history_svc=_price_history_svc)
+
+    # Fetch open positions from the active broker (same as /p)
+    positions    = []
+    own_position = None   # rich data for the symbol being analysed, if held
+    if broker is not None:
+        try:
+            raw_positions = await broker.get_positions()
             try:
-                raw_positions = await broker.get_positions()
-                try:
-                    acc = await broker.get_account_info()
-                    total_value = acc.current_value or 1.0
-                except Exception:
-                    total_value = sum(abs(p.market_value) for p in raw_positions) or 1.0
-                for p in raw_positions:
-                    if not p.symbol or p.quantity == 0:
-                        continue
-                    weight_pct = abs(p.market_value) / total_value * 100
-                    positions.append({
-                        "symbol":     p.symbol,
-                        "isin":       getattr(p, "id", "") or "",
-                        "side":       p.side.value if hasattr(p.side, "value") else str(p.side),
-                        "weight_pct": round(weight_pct, 1),
-                        "sector":     "",
-                    })
-            except Exception as e:
-                print(f"  ⚠ Could not fetch positions: {e}")
+                acc = await broker.get_account_info()
+                total_value = acc.current_value or 1.0
+            except Exception:
+                total_value = sum(abs(p.market_value) for p in raw_positions) or 1.0
+            for p in raw_positions:
+                if not p.symbol or p.quantity == 0:
+                    continue
+                weight_pct = abs(p.market_value) / total_value * 100
+                side_str   = p.side.value if hasattr(p.side, "value") else str(p.side)
+                positions.append({
+                    "symbol":     p.symbol,
+                    "isin":       getattr(p, "id", "") or "",
+                    "side":       side_str,
+                    "weight_pct": round(weight_pct, 1),
+                    "sector":     "",
+                })
+                if p.symbol.upper() == symbol:
+                    own_position = {
+                        "side":        side_str,
+                        "quantity":    p.quantity,
+                        "avg_price":   getattr(p, "average_price", 0.0) or 0.0,
+                        "market_value": abs(p.market_value),
+                        "weight_pct":  round(weight_pct, 1),
+                        "upnl":        getattr(p, "unrealized_pnl", 0.0) or 0.0,
+                        "upnl_pct":    getattr(p, "unrealized_pnl_percentage", 0.0) or 0.0,
+                    }
+        except Exception as e:
+            print(f"  ⚠ Could not fetch positions: {e}")
 
-        report = await svc.analyse(symbol, current_positions=positions or None)
-        _print_report(report, spread_info=spread_info)
+    report = await svc.analyse(symbol, current_positions=positions or None,
+                               live_bid=live_bid, live_ask=live_ask,
+                               own_position=own_position,
+                               print_prompt=print_prompt)
+    return report, spread_info, own_position
+
+
+async def cmd_trade_helper(broker, args: list) -> None:
+    if not args:
+        print("Usage: /th SYMBOL [--pp]")
+        print("  Deep pre-trade analysis — technicals + market context + news + LLM verdict.")
+        print("  --pp   Print the full LLM prompt and exit (no API call).")
+        print("  Requires FMP_API_KEY (prices/profile). XAI_API_KEY for LLM synthesis.")
+        return
+
+    print_prompt = "--pp" in args
+    args         = [a for a in args if a != "--pp"]
+    symbol       = args[0].upper()
+
+    try:
+        result = await _analyse_symbol(broker, symbol, print_prompt=print_prompt)
     except Exception as e:
         print(f"❌ {e}")
+        return
+
+    if result is None:
+        return
+
+    report, spread_info, own_position = result
+    if not print_prompt:
+        _print_report(report, spread_info=spread_info, own_position=own_position)
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -108,7 +163,43 @@ def _pct(v: float, sign: bool = True) -> str:
     return f"{v:+.2f}%" if sign else f"{v:.2f}%"
 
 
-def _print_report(r, spread_info: str = "") -> None:
+def _position_action(verdict: str, side_bias: str, pos: dict) -> tuple[str, str]:
+    """Return (action_label, reason) for an existing position given the current verdict."""
+    pos_side   = pos["side"].lower()
+    bias       = (side_bias or "long").lower()
+    same_dir   = (bias in pos_side) or (pos_side in bias) or (
+                  bias == "long"  and pos_side in ("buy",  "long")  or
+                  bias == "short" and pos_side in ("sell", "short")
+                 )
+    upnl_pct   = pos["upnl_pct"]
+
+    if verdict == "AVOID":
+        if same_dir:
+            if upnl_pct >= 10:
+                return "TRIM / TAKE PROFITS", f"verdict AVOID — up {upnl_pct:+.1f}%, protect gains"
+            elif upnl_pct <= -8:
+                return "EXIT / CUT LOSSES", f"verdict AVOID — down {upnl_pct:+.1f}%, limit drawdown"
+            else:
+                return "TRIM", f"verdict AVOID — reduce exposure"
+        else:
+            return "HOLD / ADD", "verdict AVOID confirms short thesis — consider adding"
+
+    elif verdict == "ENTER":
+        if same_dir:
+            return "ADD", f"verdict ENTER confirms direction — consider adding to position"
+        else:
+            return "FLIP / CLOSE", f"verdict ENTER {bias.upper()} contradicts current {pos_side.upper()} — close or flip"
+
+    else:  # WATCH
+        if same_dir:
+            if upnl_pct >= 15:
+                return "HOLD / PARTIAL TRIM", f"up {upnl_pct:+.1f}% — consider locking partial profits while waiting"
+            return "HOLD", "verdict WATCH — no action yet, monitor for confirmation"
+        else:
+            return "HOLD", "verdict WATCH — short thesis unconfirmed, hold and watch"
+
+
+def _print_report(r, spread_info: str = "", own_position: dict | None = None) -> None:
     GREEN, RED, RESET = tty_colors()
     YELLOW = _YELLOW
 
@@ -137,6 +228,39 @@ def _print_report(r, spread_info: str = "") -> None:
     bar_tag  = f"last 5m bar: {lb}" if lb else "last 5m bar: n/a"
     pos_tag  = f"portfolio: {', '.join(p['symbol'] for p in pp)}" if pp else "portfolio: (none passed)"
     print(f"  {YELLOW}[data] {bar_tag} | {pos_tag}{RESET}")
+
+    # ── Open position (if held) ───────────────────────────────────────────────
+    if own_position:
+        pos    = own_position
+        upnl_c = GREEN if pos["upnl"] >= 0 else RED
+        print(f"\n  Open Position")
+        print(f"  {dash}")
+        print(
+            f"  {pos['side'].upper():5}  {pos['quantity']:,.0f} sh"
+            f"  ·  avg ${pos['avg_price']:,.2f}"
+            f"  ·  mkt ${pos['market_value']:,.0f}"
+            f"  ·  weight {pos['weight_pct']:.1f}%"
+        )
+        print(f"  Unrealized:  {upnl_c}{pos['upnl']:+,.2f}  ({pos['upnl_pct']:+.2f}%){RESET}")
+
+        # Show AI recommendation if the LLM returned position_action, else fall back
+        pa = getattr(r, "position_action", None)
+        if pa and pa.get("action"):
+            action   = pa["action"]
+            reason   = pa.get("reason", "")
+            size_pct = pa.get("size_pct")
+            re_entry = pa.get("re_entry")
+            ac = RED if action in ("TRIM", "EXIT") else (GREEN if action == "ADD" else YELLOW)
+            size_tag = f"  {size_pct}% of position" if size_pct else ""
+            print(f"  Rec:  {ac}{action}{RESET}{size_tag}  — {reason}")
+            if re_entry and action in ("TRIM", "EXIT"):
+                print(f"  Re-entry:  {re_entry}")
+        else:
+            # Deterministic fallback when LLM didn't return position_action
+            action, reason = _position_action(r.verdict, getattr(r, "side_bias", "long"), pos)
+            ac = RED if any(w in action for w in ("TRIM", "EXIT", "CUT", "FLIP", "CLOSE")) else (
+                 GREEN if "ADD" in action else YELLOW)
+            print(f"  Rec:  {ac}{action}{RESET}  — {reason}")
 
     # ── Market context ────────────────────────────────────────────────────────
     mkt = r.market_context

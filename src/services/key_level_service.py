@@ -28,9 +28,10 @@ from services.price_history_service import PriceHistoryService
 
 logger = getLogger(__name__)
 
-_CLUSTER_PCT          = 0.003   # 0.3% — levels within this band get merged
+_CLUSTER_PCT          = 0.005   # 0.5% — levels within this band get merged
 _SWING_WINDOW_DAILY   = 3       # bars each side for daily swing detection
-_SWING_WINDOW_HOURLY  = 2       # bars each side for hourly swing detection
+_SWING_WINDOW_HOURLY  = 3       # bars each side for hourly swing detection (stricter → fewer levels)
+_MAX_HOURLY_LEVELS    = 4       # max resistance + max support from 1H swings
 
 
 # ── Output dataclass ──────────────────────────────────────────────────────────
@@ -63,22 +64,23 @@ class KeyLevels:
 
     def labels(self) -> dict[float, str]:
         """level_value → human-readable label for logging and notifications."""
+        r = round
         m: dict[float, str] = {}
-        if self.prev_day_high: m[self.prev_day_high] = "Prev Day High"
-        if self.prev_day_low:  m[self.prev_day_low]  = "Prev Day Low"
-        if self.pivot_pp: m[self.pivot_pp] = "Pivot PP"
-        if self.pivot_r1: m[self.pivot_r1] = "Pivot R1"
-        if self.pivot_r2: m[self.pivot_r2] = "Pivot R2"
-        if self.pivot_r3: m[self.pivot_r3] = "Pivot R3"
-        if self.pivot_s1: m[self.pivot_s1] = "Pivot S1"
-        if self.pivot_s2: m[self.pivot_s2] = "Pivot S2"
-        if self.pivot_s3: m[self.pivot_s3] = "Pivot S3"
-        for v in self.hourly_resistance: m[v] = "1H Resistance"
-        for v in self.hourly_support:    m[v] = "1H Support"
-        for v in self.daily_resistance:  m[v] = "1D Resistance"
-        for v in self.daily_support:     m[v] = "1D Support"
-        if self.hod_5min_ago: m[self.hod_5min_ago] = "HOD"
-        if self.lod_5min_ago: m[self.lod_5min_ago] = "LOD"
+        if self.prev_day_high: m[r(self.prev_day_high, 4)] = "Prev Day High"
+        if self.prev_day_low:  m[r(self.prev_day_low,  4)] = "Prev Day Low"
+        if self.pivot_pp: m[r(self.pivot_pp, 4)] = "Pivot PP"
+        if self.pivot_r1: m[r(self.pivot_r1, 4)] = "Pivot R1"
+        if self.pivot_r2: m[r(self.pivot_r2, 4)] = "Pivot R2"
+        if self.pivot_r3: m[r(self.pivot_r3, 4)] = "Pivot R3"
+        if self.pivot_s1: m[r(self.pivot_s1, 4)] = "Pivot S1"
+        if self.pivot_s2: m[r(self.pivot_s2, 4)] = "Pivot S2"
+        if self.pivot_s3: m[r(self.pivot_s3, 4)] = "Pivot S3"
+        for v in self.hourly_resistance: m[r(v, 4)] = "1H Resistance"
+        for v in self.hourly_support:    m[r(v, 4)] = "1H Support"
+        for v in self.daily_resistance:  m[r(v, 4)] = "1D Resistance"
+        for v in self.daily_support:     m[r(v, 4)] = "1D Support"
+        if self.hod_5min_ago: m[r(self.hod_5min_ago, 4)] = "HOD"
+        if self.lod_5min_ago: m[r(self.lod_5min_ago, 4)] = "LOD"
         return m
 
     def static_levels(self) -> list[float]:
@@ -134,9 +136,11 @@ class KeyLevelService:
 
         # Hourly bars come oldest→newest (FMP reverses intraday).
         if hourly_bars:
-            kl.hourly_resistance, kl.hourly_support = _swing_levels(
-                hourly_bars, _SWING_WINDOW_HOURLY
-            )
+            last_close = hourly_bars[-1].close if hourly_bars else 0
+            res, sup = _swing_levels(hourly_bars, _SWING_WINDOW_HOURLY)
+            # Keep only the N levels closest to current price (above/below respectively)
+            kl.hourly_resistance = sorted(res, key=lambda v: abs(v - last_close))[:_MAX_HOURLY_LEVELS]
+            kl.hourly_support    = sorted(sup, key=lambda v: abs(v - last_close))[:_MAX_HOURLY_LEVELS]
 
         # Intraday 5min bars: oldest→newest.
         # Exclude the last bar (currently open) so HOD/LOD reflects confirmed closes.
@@ -145,9 +149,11 @@ class KeyLevelService:
             kl.hod_5min_ago = max(b.high for b in confirmed)
             kl.lod_5min_ago = min(b.low  for b in confirmed)
 
+        hod_s = f"{kl.hod_5min_ago:.4f}" if kl.hod_5min_ago else "not-set"
+        lod_s = f"{kl.lod_5min_ago:.4f}" if kl.lod_5min_ago else "not-set"
         logger.info(
-            "KeyLevelService: %s — %d static levels + HOD/LOD %.4f/%.4f",
-            symbol, len(kl.static_levels()), kl.hod_5min_ago, kl.lod_5min_ago,
+            "KeyLevelService: %s — %d static levels + HOD/LOD %s/%s",
+            symbol, len(kl.static_levels()), hod_s, lod_s,
         )
         return kl
 
@@ -156,8 +162,12 @@ class KeyLevelService:
         return dict(zip(symbols, results))
 
     async def refresh_hod_lod(self, symbol: str, existing: KeyLevels) -> KeyLevels:
-        """Re-fetch today's intraday bars and update HOD/LOD on an existing KeyLevels."""
-        intraday_bars = await self._history.get_intraday_bars(symbol)
+        """Re-fetch today's intraday bars and update HOD/LOD on an existing KeyLevels.
+
+        Always bypasses the Redis cache so HOD/LOD reflects bars that closed in
+        the last few minutes, not the 5-minute-old cached snapshot.
+        """
+        intraday_bars = await self._history.get_intraday_bars(symbol, force_fresh=True)
         if intraday_bars:
             confirmed = intraday_bars[:-1] if len(intraday_bars) > 1 else intraday_bars
             existing.hod_5min_ago = max(b.high for b in confirmed)

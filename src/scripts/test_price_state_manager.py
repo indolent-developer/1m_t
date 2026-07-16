@@ -72,7 +72,8 @@ async def main() -> None:
 
     fmp_key  = os.environ.get("FMP_API_KEY", "")
     symbols  = list(LEVELS.keys())
-    monitor  = PriceMonitor(symbols=symbols, bus=bus, poll_interval=20)
+    from core.config.config_models import PriceMonitorConfig
+    monitor  = PriceMonitor(symbols=symbols, bus=bus, config=PriceMonitorConfig(poll_interval=20))
     fmp      = FmpDataFetcher({"api_key": fmp_key})
     history  = PriceHistoryService(
         fetcher=fmp,

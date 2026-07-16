@@ -15,6 +15,12 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 _CONVICTION_MULT = 0.5
+DEFAULT_MIN_ATR_PCT = 0.005
+
+
+def effective_atr(atr: float, price: float, min_atr_pct: float = DEFAULT_MIN_ATR_PCT) -> float:
+    """Floor a raw ATR reading at min_atr_pct of price so downstream zones/thresholds can't collapse to ~0."""
+    return max(atr, price * min_atr_pct)
 
 
 class _Pos(str, Enum):
@@ -57,6 +63,7 @@ class LevelTracker:
     update(tick) → list[PriceLevelEvent]
 
     Zone:          [level - atr*band_mult,  level + atr*band_mult]
+                   atr is floored at price*min_atr_pct so a stale/tiny reading can't collapse the zone
     Convincing:    price beyond level ± atr*0.5
 
     Bounce:        came from ABOVE, spent ≥ dwell_seconds in zone, returned ABOVE
@@ -81,6 +88,8 @@ class LevelTracker:
         band_mult: float = 0.3,
         dwell_seconds: int = 120,
         atr_period: int = 14,
+        min_atr_pct: float = DEFAULT_MIN_ATR_PCT,  # floor ATR at this fraction of price so zone/conviction never collapse to ~0
+
         # ── break confirmation (outside zone) ─────────────────────────────────
         break_confirm_seconds: int = 60,
         break_confirm_ticks: int = 3,
@@ -97,6 +106,7 @@ class LevelTracker:
         self._bmult  = band_mult
         self._dwell  = dwell_seconds
         self._atrp   = atr_period
+        self._min_atr_pct = min_atr_pct
 
         self._confirm_secs    = break_confirm_seconds
         self._confirm_ticks   = break_confirm_ticks
@@ -128,10 +138,11 @@ class LevelTracker:
         )
 
         # Live ATR zone — used for reporting and for starting new pending states.
+        price   = tick.price
+        atr     = effective_atr(atr, price, self._min_atr_pct)
         band    = atr * self._bmult
         zone_lo = self.level - band
         zone_hi = self.level + band
-        price   = tick.price
 
         # While tracking a pending state, classify price against the snapshotted zone
         # so ATR expansion/contraction cannot phantom-cancel an in-progress dwell.

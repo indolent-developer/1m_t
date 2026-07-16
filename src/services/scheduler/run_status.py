@@ -10,7 +10,7 @@ File layout (data/scheduler_runs.json):
       "status": "success",
       "attempts": 1,
       "last_run_at": "2026-06-17T02:05:00+02:00",
-      "output_file": "data/daily_morning/post-market-movers/17.06.2026_post_movers.csv",
+      "output_file": "data/daily_morning/post-market-movers/06.17.2026_post_movers.csv",
       "error": null
     },
     "prompt_1": {

@@ -125,12 +125,15 @@ class YahooFinanceDataFetcher(DataFetcherBase):
         published: dt.datetime
         if pub_str:
             try:
-                published = dt.datetime.strptime(pub_str, "%Y-%m-%dT%H:%M:%SZ")
+                published = dt.datetime.strptime(pub_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
             except ValueError:
-                published = dt.datetime.now()
+                published = dt.datetime.now(dt.timezone.utc)
         else:
             ppt = item.get("providerPublishTime", 0)
-            published = dt.datetime.fromtimestamp(int(ppt)) if ppt else dt.datetime.now()
+            published = (
+                dt.datetime.fromtimestamp(int(ppt), tz=dt.timezone.utc)
+                if ppt else dt.datetime.now(dt.timezone.utc)
+            )
 
         # Publisher
         prov = content.get("provider", {})

@@ -22,106 +22,90 @@ async def cmd_ind(broker, args: list) -> None:
     ext_tag  = " +ext" if extended else ""
     print(f"⏳ Fetching {symbol} ({tf}{ext_tag})…")
     try:
-        from interfaces.telegram.commands import _run_indicators
-        data, ts = await _run_indicators(symbol, tf, extended=extended)
+        from services.command_service import CommandService
+        r         = await CommandService(broker).indicators(symbol, tf, extended=extended)
         GREEN, RED, RESET = tty_colors()
-        st_dir   = data.get("st_dir")
-        st_color = GREEN if st_dir == 1 else RED
-        st_label = "Long " if st_dir == 1 else "Short"
-        flip_tag = "  [FLIP]" if data.get("st_flipped") else ""
-        rsi_val  = data.get("rsi")
-        rsi_tag  = "  🔥" if rsi_val and rsi_val >= 70 else ("  🧊" if rsi_val and rsi_val <= 30 else "")
-        adx_val  = data.get("adx")
-        adx_str  = f"{adx_val:.1f}" if adx_val is not None else "—"
+        st_color  = GREEN if r.st_dir == 1 else RED
+        st_label  = "Long " if r.st_dir == 1 else "Short"
+        flip_tag  = "  [FLIP]" if r.st_flipped else ""
+        rsi_tag   = "  🔥" if r.rsi and r.rsi >= 70 else ("  🧊" if r.rsi and r.rsi <= 30 else "")
+        adx_str   = f"{r.adx:.1f}" if r.adx is not None else "—"
+        def _v(v): return str(v) if v is not None else "—"
         print(
-            f"\n📊 Indicators — {symbol} ({tf}{ext_tag})  {ts}\n"
+            f"\n📊 Indicators — {symbol} ({tf}{ext_tag})  {r.ts}\n"
             f"  {'─'*40}\n"
-            f"  ATR        {data.get('atr') or '—':>10}  ({data.get('atr_pct') or '—'}%)\n"
-            f"  RSI        {data.get('rsi') or '—':>10}{rsi_tag}\n"
+            f"  ATR        {_v(r.atr):>10}  ({_v(r.atr_pct)}%)\n"
+            f"  RSI        {_v(r.rsi):>10}{rsi_tag}\n"
             f"  ADX 20     {adx_str:>10}\n"
-            f"  EMA 8      {data.get('ema8') or '—':>10}\n"
-            f"  EMA 20     {data.get('ema20') or '—':>10}\n"
-            f"  SuperTrend {st_color}{st_label} {data.get('st_value') or '—':>8}{RESET}{flip_tag}\n"
+            f"  EMA 8      {_v(r.ema8):>10}\n"
+            f"  EMA 20     {_v(r.ema20):>10}\n"
+            f"  SuperTrend {st_color}{st_label} {_v(r.st_value):>8}{RESET}{flip_tag}\n"
         )
     except Exception as e:
         print(f"❌ {e}")
 
 
 async def cmd_indp(broker, args: list) -> None:
-    # ── Sub-commands: ignore / unignore / list ────────────────────────────────
+    from services.command_service import CommandService
+    svc = CommandService(broker)
+
     if args and args[0].lower() == "ignore" and len(args) >= 2:
         name = " ".join(args[1:]).lower()
-        from interfaces.telegram.commands import _load_ignore, _save_ignore
-        ig = _load_ignore(); ig.add(name); _save_ignore(ig)
+        svc.ignore_list_add(name)
         print(f"✅ Added '{name}' to ignore list")
         return
     if args and args[0].lower() == "unignore" and len(args) >= 2:
         name = " ".join(args[1:]).lower()
-        from interfaces.telegram.commands import _load_ignore, _save_ignore
-        ig = _load_ignore(); ig.discard(name); _save_ignore(ig)
+        svc.ignore_list_remove(name)
         print(f"✅ Removed '{name}' from ignore list")
         return
     if args and args[0].lower() == "list":
-        from interfaces.telegram.commands import _load_ignore
-        ig = _load_ignore()
+        ig = svc.ignore_list_get()
         print("Ignore list:") if ig else print("Ignore list is empty.")
-        for e in sorted(ig):
-            print(f"  • {e}")
+        for e in sorted(ig): print(f"  • {e}")
         return
 
     tf = args[0].lower() if args else "1m"
     print(f"⏳ Running portfolio indicators ({tf} +ext)…")
     try:
-        from interfaces.telegram.commands import _run_portfolio_indicators
-        results, skipped = await _run_portfolio_indicators(broker, tf=tf, extended=True)
-        if not results and not skipped:
+        pr = await svc.portfolio_indicators(tf=tf, extended=True)
+        if not pr.rows and not pr.skipped:
             print("📭 No open positions.")
             return
         GREEN, RED, RESET = tty_colors()
-        results.sort(key=lambda r: r[2].get("atr_pct") or 0, reverse=True)
-        timestamps = [ts for _, _, _, ts in results if ts]
-        oldest_ts  = min(timestamps) if timestamps else "?"
+        rows      = sorted(pr.rows, key=lambda r: r.indicators.atr_pct or 0, reverse=True)
+        oldest_ts = min((r.indicators.ts for r in rows if r.indicators.ts), default="?")
         print(f"\n📊 Portfolio — {tf} +ext  (data as of {oldest_ts})")
         print(f"  {'─'*84}")
         print(f"  {'Ticker':<6}  {'ST':>9}  {'ST%':>6}  {'RSI':>4}  {'ADX':>4}  {'ATR%':>5}  {'EMA8':>8}  {'EMA20':>8}  EMA")
         print(f"  {'─'*84}")
-        for ticker, _, data, ts in results:
-            st_dir    = data.get("st_dir")
-            st_color  = GREEN if st_dir == 1 else RED
-            st_val    = data.get("st_value")
-            close_val = data.get("close")
-            rsi_val   = data.get("rsi")
-            adx_val   = data.get("adx")
-            atr_pct   = data.get("atr_pct")
-            ema8_val  = data.get("ema8")
-            ema20_val = data.get("ema20")
-            flip      = " [F]" if data.get("st_flipped") else ""
-            st_label  = "▲" if st_dir == 1 else "▼"
+        for row in rows:
+            ind       = row.indicators
+            st_color  = GREEN if ind.st_dir == 1 else RED
+            flip      = " [F]" if ind.st_flipped else ""
+            st_label  = "▲" if ind.st_dir == 1 else "▼"
             ema_cross = ""
-            if ema8_val is not None and ema20_val is not None:
-                ema_cross = " (T)" if ema8_val > ema20_val else " (↓)"
-
+            if ind.ema8 is not None and ind.ema20 is not None:
+                ema_cross = " (T)" if ind.ema8 > ind.ema20 else " (↓)"
             def _f(v, fmt): return f"{v:{fmt}}" if v is not None else "—"
-
             st_dist_str = "—"
-            if st_val is not None and close_val:
-                st_dist_str = f"{(close_val - st_val) / st_val * 100:+.1f}%"
-
+            if ind.st_value is not None and ind.close:
+                st_dist_str = f"{(ind.close - ind.st_value) / ind.st_value * 100:+.1f}%"
             print(
-                f"  {ticker:<6}  "
-                f"{st_color}{st_label} {_f(st_val, '8.2f')}{RESET}"
+                f"  {row.ticker:<6}  "
+                f"{st_color}{st_label} {_f(ind.st_value, '8.2f')}{RESET}"
                 f"  {st_dist_str:>6}"
-                f"  {_f(rsi_val, '4.0f')}"
-                f"  {_f(adx_val, '4.0f')}"
-                f"  {_f(atr_pct, '5.2f')}%"
-                f"  {_f(ema8_val, '8.2f')}"
-                f"  {_f(ema20_val, '8.2f')}"
+                f"  {_f(ind.rsi, '4.0f')}"
+                f"  {_f(ind.adx, '4.0f')}"
+                f"  {_f(ind.atr_pct, '5.2f')}%"
+                f"  {_f(ind.ema8, '8.2f')}"
+                f"  {_f(ind.ema20, '8.2f')}"
                 f"{ema_cross}{flip}"
             )
-        if skipped:
-            names  = ", ".join(n for n, _ in skipped[:8])
-            suffix = f" +{len(skipped)-8} more" if len(skipped) > 8 else ""
-            print(f"\n  ⚠️  Skipped ({len(skipped)}): {names}{suffix}")
+        if pr.skipped:
+            names  = ", ".join(n for n, _ in pr.skipped[:8])
+            suffix = f" +{len(pr.skipped)-8} more" if len(pr.skipped) > 8 else ""
+            print(f"\n  ⚠️  Skipped ({len(pr.skipped)}): {names}{suffix}")
         print()
     except Exception as e:
         print(f"❌ {e}")
@@ -131,31 +115,16 @@ async def cmd_scan(args: list) -> None:
     if not args:
         print("Usage: /scan pm | pre | vol | spikes | parabolic")
         return
-    scan_type   = args[0].lower()
-    scanner_map = {
-        "pm":        ("run_post_market_scanner",  {}),
-        "pre":       ("run_pre_market_scanner",   {}),
-        "vol":       ("run_daily_high_volumes",   {"min_relvol": 3.0, "mode_label": "FIXED"}),
-        "spikes":    ("run_spikes_scanner",       {}),
-        "parabolic": ("run_parabolic_scanner",    {}),
-    }
-    if scan_type not in scanner_map:
-        print("Unknown scanner. Use: pm | pre | vol | spikes | parabolic")
-        return
-    import importlib.util
-    import io
-    from contextlib import redirect_stdout
-    _SCANNERS        = _SRC / "scripts" / "scanners"
-    mod_name, kwargs = scanner_map[scan_type]
-    path             = _SCANNERS / f"{mod_name}.py"
-    spec             = importlib.util.spec_from_file_location(mod_name, path)
-    mod              = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    buf = io.StringIO()
+    scan_type = args[0].lower()
     print(f"⏳ Running {scan_type} scanner…")
-    with redirect_stdout(buf):
-        mod.run_scanner(**kwargs)
-    print(buf.getvalue())
+    try:
+        from services.command_service import CommandService, CommandError
+        output = await CommandService(broker=None).scan(scan_type)
+        print(output)
+    except CommandError as e:
+        print(f"❌ {e}")
+    except Exception as e:
+        print(f"❌ Scanner error: {e}")
 
 
 async def cmd_news(args: list) -> None:
@@ -455,6 +424,7 @@ async def cmd_ml(broker, args: list, ml_tasks: dict) -> None:
             print(f"✅ Loaded: {', '.join(started)}")
             if break_fn:
                 print("   Break alerts → Telegram")
+            print("   ⚠️  Price monitor service must be running (run_live_monitor.py) for alerts to fire.")
         else:
             print("Nothing new to load.")
         return
@@ -563,3 +533,51 @@ async def cmd_ml(broker, args: list, ml_tasks: dict) -> None:
     lvl_str = ", ".join(str(l) for l in levels)
     tg_note = "  (break alerts → Telegram)" if break_fn else ""
     print(f"✅ Monitoring {symbol} at [{lvl_str}]  filters=[{flt_str}]{tg_note}")
+    print("   ⚠️  Price monitor service must be running (run_live_monitor.py) for alerts to fire.")
+
+
+async def cmd_profile(args: list) -> None:
+    """Fetch company profile via FundamentalsService (/stable/profile) and show candidate filter verdict."""
+    if not args:
+        print("Usage: /profile SYMBOL")
+        return
+    symbol = args[0].upper()
+
+    _MIN_MCAP = 300_000_000
+    _MIN_VOL  = 1_000_000
+
+    print(f"\n  Fetching profile for {symbol} (stable/profile)…\n")
+
+    try:
+        from services.fundamentals_service import FundamentalsService
+        svc = FundamentalsService()
+        profile = await svc.get_profile(symbol)
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+        return
+
+    if profile is None:
+        print(f"  ❌ No profile returned for {symbol}")
+        print(f"     → FMP_API_KEY may be invalid or {symbol} not found on stable/profile")
+        return
+
+    mcap = profile.market_cap or 0
+    avol = profile.average_volume
+
+    print(f"  company    : {profile.company_name}")
+    print(f"  exchange   : {profile.exchange}")
+    print(f"  industry   : {profile.industry or '—'}")
+    print(f"  market_cap : {mcap/1e9:.2f}B  (min {_MIN_MCAP/1e6:.0f}M)  {'✅' if mcap > _MIN_MCAP else '❌'}")
+    print(f"  avg_volume : {f'{avol/1e6:.2f}M' if avol else 'n/a'}  (min {_MIN_VOL/1e6:.1f}M)  "
+          f"{'✅' if avol and avol > _MIN_VOL else ('⚠ n/a — treated as pass' if not avol else '❌')}")
+
+    print()
+    mcap_ok = mcap > _MIN_MCAP
+    vol_ok  = avol is None or avol > _MIN_VOL
+    if mcap_ok and vol_ok:
+        print(f"  ✅ {symbol} PASSES candidate filter — news reactions will be monitored")
+    elif not mcap_ok:
+        print(f"  ❌ {symbol} FAILS — mcap {mcap/1e9:.2f}B below {_MIN_MCAP/1e6:.0f}M minimum")
+    else:
+        print(f"  ❌ {symbol} FAILS — avgvol {avol/1e6:.2f}M below {_MIN_VOL/1e6:.1f}M minimum")
+    print()

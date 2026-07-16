@@ -31,3 +31,4 @@ class PriceLevelEvent:
     original_break: Optional[LevelEvent] = None
     volume:         float             = 0.0
     label:          str               = ""
+    level_touched_at: Optional[datetime] = None   # when price last entered this level's zone
